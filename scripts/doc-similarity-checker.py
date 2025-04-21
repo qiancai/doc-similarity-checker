@@ -25,7 +25,7 @@ MODEL_NAME = "all-MiniLM-L6-v2"  # SentenceTransformer model name
 SIMILARITY_THRESHOLD = 0.8  # Similarity threshold (0-1)
 SEGMENT_TYPE = "paragraph"  # Text segmentation method ('paragraph' or 'sentence')
 BATCH_SIZE = 64  # Batch size for encoding
-OUTPUT_FILE = "check_results.txt"  # Output file for results
+OUTPUT_FILE = "check_results.md"  # Output file for results (changed to .md)
 USE_GPU = torch.cuda.is_available()  # Use GPU if available
 NUM_WORKERS = max(1, multiprocessing.cpu_count() - 1)  # Number of worker processes for parallel processing
 
@@ -319,34 +319,73 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
 
 def write_similarity_results(results: Dict, output_file: str):
     """
-    Write similarity results to a file
+    Write similarity results to a Markdown file
     
     Args:
         results: Dictionary with similarity results
         output_file: Path to the output file
     """
     with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(f"Document Similarity Check Results\n")
-        f.write(f"================================\n\n")
-        f.write(f"Timestamp: {results['timestamp']}\n")
-        f.write(f"Processing time: {results['processing_time']:.2f} seconds\n\n")
-        f.write(f"Found {results['total_similar_pairs']} similar segment pairs\n\n")
+        f.write(f"# Document Similarity Check Results\n\n")
+        f.write(f"**Timestamp:** {results['timestamp']}  \n")
+        f.write(f"**Processing time:** {results['processing_time']:.2f} seconds  \n\n")
+        f.write(f"**Found {results['total_similar_pairs']} similar segment pairs**\n\n")
         
         # Write results grouped by file pairs
         for (file1, file2), pairs in results['file_pairs'].items():
-            f.write(f"Similar content between files:\n")
-            f.write(f"  File 1: {file1}\n")
-            f.write(f"  File 2: {file2}\n")
-            f.write(f"  Found {len(pairs)} similar segments\n\n")
+            # Convert to relative paths if possible
+            rel_file1 = os.path.relpath(file1) if os.path.isabs(file1) else file1
+            rel_file2 = os.path.relpath(file2) if os.path.isabs(file2) else file2
+            
+            f.write(f"## Similar content between files\n\n")
+            f.write(f"**File 1:** [`{rel_file1}`]({rel_file1})  \n")
+            f.write(f"**File 2:** [`{rel_file2}`]({rel_file2})  \n")
+            f.write(f"**Found {len(pairs)} similar segments**\n\n")
             
             for i, (text1, text2, score) in enumerate(pairs, 1):
-                f.write(f"  Pair {i} (similarity: {score:.4f}):\n")
-                f.write(f"    Doc 1: {text1[:150]}...\n" if len(text1) > 150 else f"    Doc 1: {text1}\n")
-                f.write(f"    Doc 2: {text2[:150]}...\n" if len(text2) > 150 else f"    Doc 2: {text2}\n")
-                f.write("\n")
-            f.write("-" * 80 + "\n\n")
+                f.write(f"### Pair {i} (similarity: {score:.4f})\n\n")
+                
+                # Find line numbers for text1 in file1
+                line_num1 = find_line_number(file1, text1)
+                # Create a markdown link with line number in the URL
+                f.write(f"**[{rel_file1}: line {line_num1}]({rel_file1}#L{line_num1})**\n\n```\n{text1}\n```\n\n")
+                
+                # Find line numbers for text2 in file2
+                line_num2 = find_line_number(file2, text2)
+                # Create a markdown link with line number in the URL
+                f.write(f"**[{rel_file2}: line {line_num2}]({rel_file2}#L{line_num2})**\n\n```\n{text2}\n```\n\n")
+            f.write("---\n\n")
     
     print(f"\nResults written to {output_file}")
+
+def find_line_number(file_path: str, text_segment: str) -> int:
+    """
+    Find the line number where a text segment appears in a file
+    
+    Args:
+        file_path: Path to the file
+        text_segment: The text segment to find
+        
+    Returns:
+        Line number (1-indexed) where the segment starts, or 1 if not found
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            
+        # Find the starting position of the text segment in the file
+        start_pos = content.find(text_segment)
+        
+        if start_pos == -1:
+            # If exact match not found, try to find a close match
+            return 1
+            
+        # Count the number of newlines before the starting position
+        line_num = content[:start_pos].count('\n') + 1
+        return line_num
+    except Exception as e:
+        print(f"Error finding line number in {file_path}: {e}")
+        return 1
 
 def main():
     args = parse_args()
