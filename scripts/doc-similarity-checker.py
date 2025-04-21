@@ -20,7 +20,7 @@ import torch
 
 # Configuration variables - modify these as needed
 DOC_SET_1 = "/Users/grcai/Documents/GitHub/doc-similarity-checker/for-test/doc-set-1"  # Path to the first document set
-DOC_SET_2 = "/Users/grcai/Documents/GitHub/doc-similarity-checker/for-test/doc-set-2"  # Path to the second document set
+DOC_SET_2 = "/Users/grcai/Documents/GitHub/docs/vector-search"  # Path to the second document set
 MODEL_NAME = "all-MiniLM-L6-v2"  # SentenceTransformer model name
 SIMILARITY_THRESHOLD = 0.8  # Similarity threshold (0-1)f
 SEGMENT_TYPE = "sentence"  # Text segmentation method ('paragraph' or 'sentence')
@@ -317,6 +317,30 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
+def extract_title_from_markdown(file_path: str) -> str:
+    """
+    Extract the title from a markdown file by finding the first heading
+    
+    Args:
+        file_path: Path to the markdown file
+        
+    Returns:
+        The title of the document or the filename if title cannot be found
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                # Find the first line that starts with # (ignoring whitespace)
+                if line.strip().startswith('#'):
+                    # Extract the title by removing the # and whitespace
+                    return line.strip().lstrip('#').strip()
+        
+        # If no heading found, return the filename without extension
+        return os.path.splitext(os.path.basename(file_path))[0]
+    except Exception as e:
+        print(f"Error extracting title from {file_path}: {e}")
+        return os.path.basename(file_path)
+
 def write_similarity_results(results: Dict, output_file: str):
     """
     Write similarity results to a Markdown file
@@ -337,8 +361,12 @@ def write_similarity_results(results: Dict, output_file: str):
             rel_file1 = os.path.relpath(file1) if os.path.isabs(file1) else file1
             rel_file2 = os.path.relpath(file2) if os.path.isabs(file2) else file2
             
-            # Changed heading to focus on the file in set 1
-            f.write(f"## Similar content in [`{rel_file1}`]({rel_file1})\n\n")
+            # Extract document titles
+            doc1_title = extract_title_from_markdown(file1)
+            doc2_title = extract_title_from_markdown(file2)
+            
+            # Changed heading to focus on the file in set 1 with title
+            f.write(f"## Similar content in [{doc1_title}]({rel_file1})\n\n")
             f.write(f"**Compared with:** [`{rel_file2}`]({rel_file2})  \n")
             f.write(f"**Found {len(pairs)} similar segments**\n\n")
             
