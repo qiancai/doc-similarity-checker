@@ -27,17 +27,16 @@ import pickle
 DOC_SET_1 = "/Users/grcai/Documents/GitHub/doc-similarity-checker/for-test/doc-set-1"  # Path to the first document set
 DOC_SET_2 = "/Users/grcai/Documents/GitHub/docs/vector-search"  # Path to the second document set
 MODEL_NAME = "all-MiniLM-L6-v2"  # SentenceTransformer model name
-SIMILARITY_THRESHOLD = 0.83  # Similarity threshold (0-1)f
+SIMILARITY_THRESHOLD = 0.85  # Similarity threshold (0-1)f
 SEGMENT_TYPE = "sentence"  # Text segmentation method ('paragraph' or 'sentence')
 BATCH_SIZE = 64  # Batch size for encoding
 OUTPUT_FILE = "check_results.md"  # Output file for results (changed to .md)
 USE_GPU = torch.cuda.is_available()  # Use GPU if available
 NUM_WORKERS = max(1, multiprocessing.cpu_count() - 1)  # Number of worker processes for parallel processing
-# EMBEDDING_CACHE_1 = "cache/doc_set_1_embeddings.pkl"  # Path to save/load embeddings for document set 1
-# EMBEDDING_CACHE_2 = "cache/doc_set_2_embeddings.pkl"  # Path to save/load embeddings for document set 2
-EMBEDDING_CACHE_1 = ""  # Path to save/load embeddings for document set 1
-EMBEDDING_CACHE_2 = ""  # Path to save/load embeddings for document set 2
+EMBEDDING_CACHE_1 = "cache/doc_set_1_embeddings.pkl"  # Path to save/load embeddings for document set 1
+EMBEDDING_CACHE_2 = "cache/doc_set_2_embeddings.pkl"  # Path to save/load embeddings for document set 2
 FORCE_RECALCULATE = False  # Force recalculation of embeddings even if cache exists
+USE_CACHE = True  # Whether to use embedding cache (if True, read from cache; if False, generate from scratch)
 
 def parse_args():
     """Parse command line arguments"""
@@ -59,6 +58,8 @@ def parse_args():
                        help="Path to save/load embeddings for document set 2")
     parser.add_argument("--force-recalculate", action="store_true", default=FORCE_RECALCULATE,
                        help="Force recalculation of embeddings even if cache exists")
+    parser.add_argument("--use-cache", action="store_true", default=USE_CACHE, 
+                       help="Whether to use embedding cache (if True, read from cache; if False, generate from scratch)")
     return parser.parse_args()
 
 def find_markdown_files(directory: str, max_files: int = None) -> List[str]:
@@ -441,7 +442,7 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
                          batch_size: int = BATCH_SIZE, max_files: int = None, 
                          num_workers: int = NUM_WORKERS, use_gpu: bool = USE_GPU,
                          embedding_cache_1: str = None, embedding_cache_2: str = None,
-                         force_recalculate: bool = FORCE_RECALCULATE) -> Dict:
+                         force_recalculate: bool = FORCE_RECALCULATE, use_cache: bool = USE_CACHE) -> Dict:
     """
     Compare two document sets and find similar content
     
@@ -458,6 +459,7 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
         embedding_cache_1: Path to save/load embeddings for document set 1
         embedding_cache_2: Path to save/load embeddings for document set 2
         force_recalculate: Force recalculation of embeddings even if cache exists
+        use_cache: Whether to use embedding cache (if True, read from cache; if False, generate from scratch)
         
     Returns:
         Dictionary with similarity results
@@ -471,7 +473,7 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
     print(f"Using device: {device}")
     
     # Process document set 1
-    if not force_recalculate and embedding_cache_1 and is_cache_valid(embedding_cache_1, doc_set_1, model_name, segment_type):
+    if use_cache and not force_recalculate and embedding_cache_1 and is_cache_valid(embedding_cache_1, doc_set_1, model_name, segment_type):
         # Load embeddings from cache
         print(f"Loading cached embeddings for document set 1 from {embedding_cache_1}")
         embeddings1, segments1 = load_embeddings(embedding_cache_1)
@@ -490,7 +492,7 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
             save_embeddings(embedding_cache_1, embeddings1, segments1, doc_set_1, model_name, segment_type)
     
     # Process document set 2
-    if not force_recalculate and embedding_cache_2 and is_cache_valid(embedding_cache_2, doc_set_2, model_name, segment_type):
+    if use_cache and not force_recalculate and embedding_cache_2 and is_cache_valid(embedding_cache_2, doc_set_2, model_name, segment_type):
         # Load embeddings from cache
         print(f"Loading cached embeddings for document set 2 from {embedding_cache_2}")
         embeddings2, segments2 = load_embeddings(embedding_cache_2)
@@ -748,6 +750,7 @@ def main():
     embedding_cache_1 = args.embedding_cache_1
     embedding_cache_2 = args.embedding_cache_2
     force_recalculate = args.force_recalculate
+    use_cache = args.use_cache
     
     # Check if both document set paths are provided
     if not doc_set_1 or not doc_set_2:
@@ -768,7 +771,8 @@ def main():
         use_gpu=args.use_gpu,
         embedding_cache_1=embedding_cache_1,
         embedding_cache_2=embedding_cache_2,
-        force_recalculate=force_recalculate
+        force_recalculate=force_recalculate,
+        use_cache=use_cache
     )
 
     # Write results to file
