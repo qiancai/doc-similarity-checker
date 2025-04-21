@@ -35,8 +35,7 @@ USE_GPU = torch.cuda.is_available()  # Use GPU if available
 NUM_WORKERS = max(1, multiprocessing.cpu_count() - 1)  # Number of worker processes for parallel processing
 EMBEDDING_CACHE_1 = "cache/doc_set_1_embeddings.pkl"  # Path to save/load embeddings for document set 1
 EMBEDDING_CACHE_2 = "cache/doc_set_2_embeddings.pkl"  # Path to save/load embeddings for document set 2
-FORCE_RECALCULATE = False  # Force recalculation of embeddings even if cache exists
-USE_CACHE = True  # Whether to use embedding cache (if True, read from cache; if False, generate from scratch)
+USE_CACHE = True  # Whether to use embedding cache (True: use if available, False: always recalculate)
 
 def parse_args():
     """Parse command line arguments"""
@@ -56,10 +55,8 @@ def parse_args():
                        help="Path to save/load embeddings for document set 1")
     parser.add_argument("--embedding-cache-2", type=str, default=EMBEDDING_CACHE_2, 
                        help="Path to save/load embeddings for document set 2")
-    parser.add_argument("--force-recalculate", action="store_true", default=FORCE_RECALCULATE,
-                       help="Force recalculation of embeddings even if cache exists")
-    parser.add_argument("--use-cache", action="store_true", default=USE_CACHE, 
-                       help="Whether to use embedding cache (if True, read from cache; if False, generate from scratch)")
+    parser.add_argument("--no-cache", action="store_true", 
+                       help="Do not use embedding cache even if available (always recalculate)")
     return parser.parse_args()
 
 def find_markdown_files(directory: str, max_files: int = None) -> List[str]:
@@ -442,7 +439,7 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
                          batch_size: int = BATCH_SIZE, max_files: int = None, 
                          num_workers: int = NUM_WORKERS, use_gpu: bool = USE_GPU,
                          embedding_cache_1: str = None, embedding_cache_2: str = None,
-                         force_recalculate: bool = FORCE_RECALCULATE, use_cache: bool = USE_CACHE) -> Dict:
+                         use_cache: bool = USE_CACHE) -> Dict:
     """
     Compare two document sets and find similar content
     
@@ -458,8 +455,7 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
         use_gpu: Whether to use GPU for embedding generation
         embedding_cache_1: Path to save/load embeddings for document set 1
         embedding_cache_2: Path to save/load embeddings for document set 2
-        force_recalculate: Force recalculation of embeddings even if cache exists
-        use_cache: Whether to use embedding cache (if True, read from cache; if False, generate from scratch)
+        use_cache: Whether to use embedding cache (True: use if available, False: always recalculate)
         
     Returns:
         Dictionary with similarity results
@@ -473,7 +469,7 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
     print(f"Using device: {device}")
     
     # Process document set 1
-    if use_cache and not force_recalculate and embedding_cache_1 and is_cache_valid(embedding_cache_1, doc_set_1, model_name, segment_type):
+    if use_cache and embedding_cache_1 and is_cache_valid(embedding_cache_1, doc_set_1, model_name, segment_type):
         # Load embeddings from cache
         print(f"Loading cached embeddings for document set 1 from {embedding_cache_1}")
         embeddings1, segments1 = load_embeddings(embedding_cache_1)
@@ -492,7 +488,7 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
             save_embeddings(embedding_cache_1, embeddings1, segments1, doc_set_1, model_name, segment_type)
     
     # Process document set 2
-    if use_cache and not force_recalculate and embedding_cache_2 and is_cache_valid(embedding_cache_2, doc_set_2, model_name, segment_type):
+    if use_cache and embedding_cache_2 and is_cache_valid(embedding_cache_2, doc_set_2, model_name, segment_type):
         # Load embeddings from cache
         print(f"Loading cached embeddings for document set 2 from {embedding_cache_2}")
         embeddings2, segments2 = load_embeddings(embedding_cache_2)
@@ -598,7 +594,7 @@ def write_similarity_results(results: Dict, output_file: str):
             for file2, pairs in comparisons:
                 rel_file2 = os.path.relpath(file2) if os.path.isabs(file2) else file2
                 
-                f.write(f"### Compared with: [`{rel_file2}`]({rel_file2})\n\n")
+                f.write(f"Compared with: [`{rel_file2}`]({rel_file2})\n\n")
                 
                 for text1, text2, score in pairs:
                     # Check for binary or corrupted data
@@ -749,8 +745,7 @@ def main():
     output_file = args.output
     embedding_cache_1 = args.embedding_cache_1
     embedding_cache_2 = args.embedding_cache_2
-    force_recalculate = args.force_recalculate
-    use_cache = args.use_cache
+    use_cache = not args.no_cache  # Invert the no_cache flag
     
     # Check if both document set paths are provided
     if not doc_set_1 or not doc_set_2:
@@ -771,7 +766,6 @@ def main():
         use_gpu=args.use_gpu,
         embedding_cache_1=embedding_cache_1,
         embedding_cache_2=embedding_cache_2,
-        force_recalculate=force_recalculate,
         use_cache=use_cache
     )
 
