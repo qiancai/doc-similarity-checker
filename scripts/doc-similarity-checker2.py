@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+"""
+Document Similarity Checker
+This script compares two sets of markdown documents to find similar content.
+It uses sentence-transformers to generate embeddings and compute similarities.
+"""
+
+import os
+import argparse
+import glob
+import re
+import time
+import multiprocessing
+from datetime import datetime
+from typing import List, Tuple, Dict
+import numpy as np
+from tqdm import tqdm
+
+# Set TOKENIZERS_PARALLELISM environment variable to prevent warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+from sentence_transformers import SentenceTransformer, util
+import torch
+import pickle
+
+# Configuration variables - modify these as needed
+DOC_SET_1 = "/Users/grcai/Documents/GitHub/doc-similarity-checker/for-test/doc-set-1"  # Path to the first document set
+DOC_SET_2 = "/Users/grcai/Documents/GitHub/docs/vector-search"  # Path to the second document set
+MODEL_NAME = "all-MiniLM-L6-v2"  # SentenceTransformer model name
+SIMILARITY_THRESHOLD = 0.83  # Similarity threshold (0-1)f
+SEGMENT_TYPE = "sentence"  # Text segmentation method ('paragraph' or 'sentence')
+BATCH_SIZE = 64  # Batch size for encoding
+OUTPUT_FILE = "check_results.md"  # Output file for results (changed to .md)
+USE_GPU = torch.cuda.is_available()  # Use GPU if available
+NUM_WORKERS = max(1, multiprocessing.cpu_count() - 1)  # Number of worker processes for parallel processing
+# EMBEDDING_CACHE_1 = "cache/doc_set_1_embeddings.pkl"  # Path to save/load embeddings for document set 1
+# EMBEDDING_CACHE_2 = "cache/doc_set_2_embeddings.pkl"  # Path to save/load embeddings for document set 2
+EMBEDDING_CACHE_1 = ""  # Path to save/load embeddings for document set 1
+EMBEDDING_CACHE_2 = ""  # Path to save/load embeddings for document set 2
+FORCE_RECALCULATE = False  # Force recalculation of embeddings even if cache exists
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Check similarity between two document sets")
+    parser.add_argument("--doc-set-1", type=str, default=DOC_SET_1, help="Path to the first document set")
+    parser.add_argument("--doc-set-2", type=str, default=DOC_SET_2, help="Path to the second document set")
+    parser.add_argument("--model", type=str, default=MODEL_NAME, help="SentenceTransformer model name")
+    parser.add_argument("--threshold", type=float, default=SIMILARITY_THRESHOLD, help="Similarity threshold (0-1)")
+    parser.add_argument("--segment", choices=["paragraph", "sentence"], default=SEGMENT_TYPE, 
+                       help="Text segmentation method")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size for encoding")
+    parser.add_argument("--output", type=str, default=OUTPUT_FILE, help="Output file for results")
+    parser.add_argument("--workers", type=int, default=NUM_WORKERS, help="Number of worker processes")
+    parser.add_argument("--max-files", type=int, default=None, help="Maximum number of files to process per document set")
+    parser.add_argument("--use-gpu", action="store_true", default=USE_GPU, help="Use GPU for embedding generation")
+    parser.add_argument("--embedding-cache-1", type=str, default=EMBEDDING_CACHE_1, 
+                       help="Path to save/load embeddings for document set 1")
+    parser.add_argument("--embedding-cache-2", type=str, default=EMBEDDING_CACHE_2, 
+                       help="Path to save/load embeddings for document set 2")
+    parser.add_argument("--force-recalculate", action="store_true", default=FORCE_RECALCULATE,
+                       help="Force recalculation of embeddings even if cache exists")
+    return parser.parse_args()
+
+def find_markdown_files(directory: str, max_files: int = None) -> List[str]:
+    """
+    Find all markdown files in the given directory and its subdirectories
+    
+    Args:
+        directory: Path to the directory to search
+        max_files: Maximum number of files to return (for testing purposes)
+        
+    Returns:
+        List of paths to markdown files
+    """
+    files = glob.glob(os.path.join(directory, "**", "*.md"), recursive=True)
+    if max_files is not None and len(files) > max_files:
+        return files[:max_files]
+    return files
+
+def read_markdown_file(file_path: str) -> str:
+    """
+    Read the content of a markdown file and return as a string
+    
+    Args:
+        file_path: Path to the markdown file
+        
+    Returns:
+        Content of the file as a string
+    """
+    # Try multiple encodings to handle various file formats
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+    content = None
+    
+    for encoding in encodings:
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                content = f.read()
+            print(f"Successfully read {file_path} using {encoding} encoding")
+            break
+        except UnicodeDecodeError:
+            print(f"Failed to decode {file_path} with {encoding} encoding, trying next...")
+            continue
+        except FileNotFoundError:
+            print(f"Error: File not found: {file_path}")
+            return ""
+        except Exception as e:
+            print(f"Error reading {file_path} with {encoding} encoding: {e}")
+            continue
+    
+    if content is None:
+        print(f"Failed to read {file_path} with any encoding, returning empty string")
+        return ""
+    
+    return content
+
+def split_into_paragraphs(text: str) -> List[str]:
+    """
+    Split text into paragraphs
+    
+    Args:
+        text: The text to split
+        
+    Returns:
+        List of paragraphs
+    """
+    # Split by double newlines and filter out empty paragraphs
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text)]
+    return [p for p in paragraphs if p]
+
+def split_into_sentences(text: str) -> List[str]:
+    """
+    Split text into sentences (simple implementation)
+    
+    Args:
+        text: The text to split
+        
+    Returns:
+        List of sentences
+    """
+    # Simple sentence splitting by common end punctuation
+    # A more sophisticated approach would use a dedicated NLP library
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    return [s.strip() for s in sentences if s.strip()]
+
+def extract_segments(file_path: str, segment_type: str) -> List[Tuple[str, str]]:
+    """
+    Extract text segments from a markdown file
+    
+    Args:
+        file_path: Path to the markdown file
+        segment_type: Type of segmentation ('paragraph' or 'sentence')
+        
+    Returns:
+        List of tuples containing (file_path, segment_text)
+    """
+    text = read_markdown_file(file_path)
+    
+    if segment_type == "paragraph":
+        segments = split_into_paragraphs(text)
+    else:  # sentence
+        segments = split_into_sentences(text)
+    
+    # Filter out too short segments and code blocks
+    filtered_segments = []
+    in_code_block = False
+    for segment in segments:
+        if segment.startswith("```") and segment.endswith("```"):
+            continue
+        if segment.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            continue
+        if len(segment.split()) >= 5:  # Only keep segments with at least 5 words
+            filtered_segments.append(segment)
+    
+    return [(file_path, segment) for segment in filtered_segments]
+
+def extract_segments_safe(file_path: str, segment_type: str) -> List[Tuple[str, str]]:
+    """
+    Safely extract text segments from a markdown file, catching and handling exceptions
+    
+    Args:
+        file_path: Path to the markdown file
+        segment_type: Type of segmentation ('paragraph' or 'sentence')
+        
+    Returns:
+        List of tuples containing (file_path, segment_text) or empty list if there was an error
+    """
+    try:
+        return extract_segments(file_path, segment_type)
+    except Exception as e:
+        print(f"Error processing file {file_path}: {e}")
+        return []
+
+def process_document_set(directory: str, segment_type: str, max_files: int = None, 
+                         num_workers: int = NUM_WORKERS) -> List[Tuple[str, str]]:
+    """
+    Process all markdown files in a document set
+    
+    Args:
+        directory: Path to the document set
+        segment_type: Type of segmentation ('paragraph' or 'sentence')
+        max_files: Maximum number of files to process (for testing)
+        num_workers: Number of worker processes
+        
+    Returns:
+        List of tuples containing (file_path, segment_text)
+    """
+    markdown_files = find_markdown_files(directory, max_files)
+    all_segments = []
+    
+    print(f"Processing {len(markdown_files)} markdown files...")
+    
+    # For small number of files, process sequentially
+    if len(markdown_files) < 10 or num_workers <= 1:
+        for file_path in tqdm(markdown_files, desc="Processing files"):
+            try:
+                segments = extract_segments(file_path, segment_type)
+                all_segments.extend(segments)
+            except Exception as e:
+                print(f"Error processing file {file_path}: {e}")
+                print(f"Skipping file {file_path}")
+    else:
+        # For larger sets, use parallel processing
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            results = list(tqdm(
+                pool.starmap(
+                    extract_segments_safe, 
+                    [(file_path, segment_type) for file_path in markdown_files]
+                ),
+                total=len(markdown_files),
+                desc="Processing files in parallel"
+            ))
+            for result in results:
+                all_segments.extend(result)
+    
+    print(f"Extracted {len(all_segments)} segments from {len(markdown_files)} files")
+    return all_segments
+
+def compute_embeddings(model: SentenceTransformer, segments: List[Tuple[str, str]], 
+                       batch_size: int) -> Tuple[torch.Tensor, List[Tuple[str, str]]]:
+    """
+    Compute embeddings for text segments
+    
+    Args:
+        model: SentenceTransformer model
+        segments: List of (file_path, segment_text) tuples
+        batch_size: Batch size for encoding
+        
+    Returns:
+        Tuple of (embeddings, segments)
+    """
+    texts = [segment[1] for segment in segments]
+    
+    # Show progress bar for embedding generation
+    embeddings = model.encode(
+        texts, 
+        batch_size=batch_size, 
+        convert_to_tensor=True,
+        show_progress_bar=True
+    )
+    
+    return embeddings, segments
+
+def find_similar_segments(segments1: List[Tuple[str, str]], embeddings1: torch.Tensor,
+                         segments2: List[Tuple[str, str]], embeddings2: torch.Tensor, 
+                         threshold: float) -> List[Tuple[Tuple[str, str], Tuple[str, str], float]]:
+    """
+    Find similar segments between two document sets
+    
+    Args:
+        segments1: List of (file_path, segment_text) tuples from the first document set
+        embeddings1: Embeddings for segments1
+        segments2: List of (file_path, segment_text) tuples from the second document set
+        embeddings2: Embeddings for segments2
+        threshold: Similarity threshold
+        
+    Returns:
+        List of (segment1, segment2, similarity_score) tuples
+    """
+    print("Computing cosine similarities...")
+    start_time = time.time()
+    
+    # For large embeddings, process in chunks to avoid memory issues
+    chunk_size = 1000  # Adjust based on available memory
+    similar_pairs = []
+    
+    total_chunks = (len(embeddings1) + chunk_size - 1) // chunk_size
+    
+    for i in tqdm(range(0, len(embeddings1), chunk_size), total=total_chunks, desc="Comparing chunks"):
+        # Get current chunk
+        embeddings1_chunk = embeddings1[i:i+chunk_size]
+        segments1_chunk = segments1[i:i+chunk_size]
+        
+        # Compute cosine similarity for current chunk
+        cosine_scores = util.cos_sim(embeddings1_chunk, embeddings2)
+        
+        # Find pairs with similarity scores above threshold
+        for chunk_idx, scores in enumerate(cosine_scores):
+            orig_idx = i + chunk_idx
+            for j, score in enumerate(scores):
+                if score >= threshold:
+                    similar_pairs.append((segments1_chunk[chunk_idx], segments2[j], score.item()))
+    
+    # Sort by similarity score (descending)
+    similar_pairs.sort(key=lambda x: x[2], reverse=True)
+    
+    elapsed_time = time.time() - start_time
+    print(f"Found {len(similar_pairs)} similar pairs in {elapsed_time:.2f} seconds")
+    
+    return similar_pairs
+
+def save_embeddings(file_path: str, embeddings: torch.Tensor, segments: List[Tuple[str, str]], 
+                   doc_dir: str, model_name: str, segment_type: str):
+    """
+    Save embeddings and segments to a pickle file
+    
+    Args:
+        file_path: Path to save the embeddings
+        embeddings: Tensor of embeddings
+        segments: List of (file_path, segment_text) tuples
+        doc_dir: Path to the document directory
+        model_name: Name of the model used
+        segment_type: Type of segmentation used
+    """
+    # Get file stats to track document directory state
+    file_stats = {}
+    for segment_path, _ in segments:
+        if os.path.isfile(segment_path):
+            file_stats[segment_path] = {
+                'mtime': os.path.getmtime(segment_path),
+                'size': os.path.getsize(segment_path)
+            }
+    
+    # Convert embeddings to numpy for better compatibility with pickle
+    embedding_data = {
+        'embeddings': embeddings.cpu().numpy() if isinstance(embeddings, torch.Tensor) else embeddings,
+        'segments': segments,
+        'timestamp': datetime.now().isoformat(),
+        'doc_dir': doc_dir,
+        'file_stats': file_stats,
+        'model_name': model_name,
+        'segment_type': segment_type,
+    }
+    
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+    
+    with open(file_path, 'wb') as f:
+        pickle.dump(embedding_data, f)
+    
+    print(f"Embeddings saved to {file_path}")
+
+def load_embeddings(file_path: str) -> Tuple[torch.Tensor, List[Tuple[str, str]]]:
+    """
+    Load embeddings and segments from a pickle file
+    
+    Args:
+        file_path: Path to load the embeddings from
+        
+    Returns:
+        Tuple of (embeddings, segments)
+    """
+    with open(file_path, 'rb') as f:
+        embedding_data = pickle.load(f)
+    
+    # Convert numpy arrays back to torch tensors
+    embeddings = torch.tensor(embedding_data['embeddings'])
+    segments = embedding_data['segments']
+    
+    # Log when the embeddings were created
+    saved_time = datetime.fromisoformat(embedding_data['timestamp'])
+    print(f"Loaded embeddings from {file_path} (created on {saved_time})")
+    
+    return embeddings, segments
+
+def is_cache_valid(cache_path: str, doc_dir: str, model_name: str, segment_type: str) -> bool:
+    """
+    Check if embedding cache is valid and up-to-date
+    
+    Args:
+        cache_path: Path to the embedding cache file
+        doc_dir: Path to the document directory
+        model_name: Name of the model being used
+        segment_type: Type of segmentation being used
+        
+    Returns:
+        True if cache is valid, False otherwise
+    """
+    if not os.path.isfile(cache_path):
+        return False
+    
+    try:
+        with open(cache_path, 'rb') as f:
+            cache_data = pickle.load(f)
+        
+        # Check if cache was created with same model and segmentation type
+        if cache_data.get('model_name') != model_name or cache_data.get('segment_type') != segment_type:
+            print(f"Cache invalid: model or segmentation type changed")
+            return False
+        
+        # Check if document directory has changed
+        if cache_data.get('doc_dir') != doc_dir:
+            print(f"Cache invalid: document directory changed")
+            return False
+        
+        # Check if any files were added, removed, or modified
+        file_stats = cache_data.get('file_stats', {})
+        
+        # Get current list of markdown files
+        current_files = find_markdown_files(doc_dir)
+        
+        # Check if any new files were added
+        cached_files = set(file_stats.keys())
+        if not all(file in cached_files for file in current_files):
+            print(f"Cache invalid: new files added to document directory")
+            return False
+        
+        # Check if any existing files were modified
+        for file_path in file_stats:
+            if not os.path.isfile(file_path):
+                print(f"Cache invalid: file {file_path} removed")
+                return False
+            
+            current_mtime = os.path.getmtime(file_path)
+            current_size = os.path.getsize(file_path)
+            
+            if (current_mtime > file_stats[file_path]['mtime'] or 
+                current_size != file_stats[file_path]['size']):
+                print(f"Cache invalid: file {file_path} modified")
+                return False
+        
+        return True
+    except Exception as e:
+        print(f"Error checking cache validity: {e}")
+        return False
+
+def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODEL_NAME, 
+                         threshold: float = SIMILARITY_THRESHOLD, segment_type: str = SEGMENT_TYPE,
+                         batch_size: int = BATCH_SIZE, max_files: int = None, 
+                         num_workers: int = NUM_WORKERS, use_gpu: bool = USE_GPU,
+                         embedding_cache_1: str = None, embedding_cache_2: str = None,
+                         force_recalculate: bool = FORCE_RECALCULATE) -> Dict:
+    """
+    Compare two document sets and find similar content
+    
+    Args:
+        doc_set_1: Path to the first document set
+        doc_set_2: Path to the second document set
+        model_name: SentenceTransformer model name
+        threshold: Similarity threshold (0-1)
+        segment_type: Type of segmentation ('paragraph' or 'sentence')
+        batch_size: Batch size for encoding
+        max_files: Maximum number of files to process per document set
+        num_workers: Number of worker processes
+        use_gpu: Whether to use GPU for embedding generation
+        embedding_cache_1: Path to save/load embeddings for document set 1
+        embedding_cache_2: Path to save/load embeddings for document set 2
+        force_recalculate: Force recalculation of embeddings even if cache exists
+        
+    Returns:
+        Dictionary with similarity results
+    """
+    start_time = time.time()
+    
+    print(f"Loading SentenceTransformer model: {model_name}")
+    device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
+    model = SentenceTransformer(model_name, device=device)
+    
+    print(f"Using device: {device}")
+    
+    # Process document set 1
+    if not force_recalculate and embedding_cache_1 and is_cache_valid(embedding_cache_1, doc_set_1, model_name, segment_type):
+        # Load embeddings from cache
+        print(f"Loading cached embeddings for document set 1 from {embedding_cache_1}")
+        embeddings1, segments1 = load_embeddings(embedding_cache_1)
+    else:
+        # Process documents and generate embeddings
+        print(f"Processing document set 1: {doc_set_1}")
+        segments1 = process_document_set(doc_set_1, segment_type, max_files, num_workers)
+        print(f"Found {len(segments1)} segments in document set 1")
+        
+        print("Computing embeddings for document set 1")
+        embeddings1, segments1 = compute_embeddings(model, segments1, batch_size)
+        
+        # Save embeddings if cache path is provided
+        if embedding_cache_1:
+            print(f"Saving embeddings for document set 1 to {embedding_cache_1}")
+            save_embeddings(embedding_cache_1, embeddings1, segments1, doc_set_1, model_name, segment_type)
+    
+    # Process document set 2
+    if not force_recalculate and embedding_cache_2 and is_cache_valid(embedding_cache_2, doc_set_2, model_name, segment_type):
+        # Load embeddings from cache
+        print(f"Loading cached embeddings for document set 2 from {embedding_cache_2}")
+        embeddings2, segments2 = load_embeddings(embedding_cache_2)
+    else:
+        # Process documents and generate embeddings
+        print(f"Processing document set 2: {doc_set_2}")
+        segments2 = process_document_set(doc_set_2, segment_type, max_files, num_workers)
+        print(f"Found {len(segments2)} segments in document set 2")
+        
+        print("Computing embeddings for document set 2")
+        embeddings2, segments2 = compute_embeddings(model, segments2, batch_size)
+        
+        # Save embeddings if cache path is provided
+        if embedding_cache_2:
+            print(f"Saving embeddings for document set 2 to {embedding_cache_2}")
+            save_embeddings(embedding_cache_2, embeddings2, segments2, doc_set_2, model_name, segment_type)
+    
+    print(f"Finding similar segments with threshold {threshold}")
+    similar_pairs = find_similar_segments(segments1, embeddings1, segments2, embeddings2, threshold)
+    
+    print(f"\nFound {len(similar_pairs)} similar segment pairs\n")
+    
+    # Group by file pairs
+    file_pairs = {}
+    for seg1, seg2, score in similar_pairs:
+        file_pair = (seg1[0], seg2[0])
+        if file_pair not in file_pairs:
+            file_pairs[file_pair] = []
+        file_pairs[file_pair].append((seg1[1], seg2[1], score))
+    
+    total_time = time.time() - start_time
+    print(f"Total processing time: {total_time:.2f} seconds")
+    
+    return {
+        "total_similar_pairs": len(similar_pairs),
+        "file_pairs": file_pairs,
+        "processing_time": total_time,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+def extract_title_from_markdown(file_path: str) -> str:
+    """
+    Extract the title from a markdown file by finding the first heading
+    
+    Args:
+        file_path: Path to the markdown file
+        
+    Returns:
+        The title of the document or the filename if title cannot be found
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                # Find the first line that starts with # (ignoring whitespace)
+                if line.strip().startswith('#'):
+                    # Extract the title by removing the # and whitespace
+                    return line.strip().lstrip('#').strip()
+        
+        # If no heading found, return the filename without extension
+        return os.path.splitext(os.path.basename(file_path))[0]
+    except Exception as e:
+        print(f"Error extracting title from {file_path}: {e}")
+        return os.path.basename(file_path)
+
+def write_similarity_results(results: Dict, output_file: str):
+    """
+    Write similarity results to a Markdown file
+    
+    Args:
+        results: Dictionary with similarity results
+        output_file: Path to the output file
+    """
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(f"# Document Similarity Check Results\n\n")
+        f.write(f"**Timestamp:** {results['timestamp']}  \n")
+        f.write(f"**Processing time:** {results['processing_time']:.2f} seconds  \n\n")
+        f.write(f"**Found {results['total_similar_pairs']} similar segment pairs**\n\n")
+        
+        # Reorganize results by doc-set-1 files
+        doc1_files = {}
+        for (file1, file2), pairs in results['file_pairs'].items():
+            if file1 not in doc1_files:
+                doc1_files[file1] = []
+            doc1_files[file1].append((file2, pairs))
+        
+        # Write results grouped by doc-set-1 files
+        for file1, comparisons in doc1_files.items():
+            # Convert to relative paths
+            rel_file1 = os.path.relpath(file1) if os.path.isabs(file1) else file1
+            
+            # Extract document title
+            doc1_title = extract_title_from_markdown(file1)
+            
+            # Write heading for doc-set-1 file
+            f.write(f"## Similar content in [{doc1_title}]({rel_file1})\n\n")
+            
+            total_segments = sum(len(pairs) for _, pairs in comparisons)
+            f.write(f"**Found {total_segments} similar segments across {len(comparisons)} comparison(s)**\n\n")
+            
+            pair_counter = 1
+            
+            # Process each comparison
+            for file2, pairs in comparisons:
+                rel_file2 = os.path.relpath(file2) if os.path.isabs(file2) else file2
+                
+                f.write(f"### Compared with: [`{rel_file2}`]({rel_file2})\n\n")
+                
+                for text1, text2, score in pairs:
+                    # Check for binary or corrupted data
+                    if not is_valid_text(text1) or not is_valid_text(text2):
+                        print(f"Warning: Skipping pair {pair_counter} due to invalid text content")
+                        continue
+                        
+                    f.write(f"#### Pair {pair_counter} (similarity: {score:.4f})\n\n")
+                    
+                    # Find line numbers for text1 in file1
+                    line_num1 = find_line_number(file1, text1)
+                    # Create a markdown link with line number in the URL
+                    f.write(f"**[{rel_file1}: line {line_num1}]({rel_file1}#L{line_num1})**\n\n```\n{text1}\n```\n\n")
+                    
+                    # Find line numbers for text2 in file2
+                    line_num2 = find_line_number(file2, text2)
+                    # Create a markdown link with line number in the URL
+                    f.write(f"**[{rel_file2}: line {line_num2}]({rel_file2}#L{line_num2})**\n\n```\n{text2}\n```\n\n")
+                    
+                    pair_counter += 1
+                
+                f.write("---\n\n")
+    
+    print(f"\nResults written to {output_file}")
+
+def find_line_number(file_path: str, text_segment: str) -> int:
+    """
+    Find the line number where a text segment appears in a file
+    
+    Args:
+        file_path: Path to the file
+        text_segment: The text segment to find
+        
+    Returns:
+        Line number (1-indexed) where the segment starts, or 1 if not found
+    """
+    # Try multiple encodings to handle various file formats
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+    
+    for encoding in encodings:
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                content = f.read()
+                
+            # Find the starting position of the text segment in the file
+            start_pos = content.find(text_segment)
+            
+            if start_pos == -1:
+                # Try to find a close match by removing whitespace
+                clean_segment = ' '.join(text_segment.split())
+                clean_content = ' '.join(content.split())
+                start_pos = clean_content.find(clean_segment)
+                
+                if start_pos == -1:
+                    # If still no match, try the next encoding or continue with default
+                    continue
+                    
+                # If we found a match in the clean content, we need to map it back to the original
+                # This is an approximation since whitespace has been normalized
+                approx_pos = 0
+                for i, c in enumerate(clean_content):
+                    if i == start_pos:
+                        break
+                    if c != ' ':
+                        approx_pos += 1
+                start_pos = min(approx_pos, len(content) - 1)
+            
+            # Count the number of newlines before the starting position
+            line_num = content[:start_pos].count('\n') + 1
+            print(f"Found text segment at line {line_num} in {file_path} using {encoding} encoding")
+            return line_num
+            
+        except UnicodeDecodeError:
+            # Try next encoding
+            continue
+        except Exception as e:
+            print(f"Error finding line number in {file_path} with {encoding} encoding: {e}")
+            # Try next encoding
+            continue
+    
+    # If all encodings failed, return default
+    print(f"Could not find line number for text segment in {file_path} after trying multiple encodings")
+    return 1
+
+def create_embedding(text: str, model_name: str = MODEL_NAME) -> List[float]:
+    """
+    Create an embedding for the given text using SentenceTransformer
+    
+    Args:
+        text: Text to create embedding for
+        model_name: SentenceTransformer model name
+        
+    Returns:
+        Embedding as a list of floats
+    """
+    if not text.strip():
+        print("Warning: Empty text provided for embedding, returning zero vector")
+        # Return zero vector with appropriate dimensions for the model
+        return [0.0] * 384  # Common dimension for SentenceTransformer models
+    
+    try:
+        # Load the model
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = SentenceTransformer(model_name, device=device)
+        
+        # Generate embedding
+        embedding = model.encode(text, convert_to_numpy=True)
+        return embedding.tolist()
+    except Exception as e:
+        print(f"Error creating embedding: {e}")
+        # Return a zero vector with a default dimension
+        return [0.0] * 384  # Common dimension for SentenceTransformer models
+
+def is_valid_text(text: str) -> bool:
+    """
+    Check if a text string is valid printable content
+    
+    Args:
+        text: The text to check
+        
+    Returns:
+        True if the text is valid, False otherwise
+    """
+    if not isinstance(text, str):
+        return False
+        
+    # Check length
+    if len(text) > 10000:  # Arbitrarily large text is likely not valid content
+        return False
+    
+    # Check for a reasonable ratio of printable characters
+    import string
+    printable_chars = set(string.printable)
+    printable_count = sum(1 for c in text if c in printable_chars)
+    
+    # If more than 15% of characters are non-printable, consider it invalid
+    if len(text) > 0 and printable_count / len(text) < 0.85:
+        return False
+        
+    return True
+
+def main():
+    args = parse_args()
+    
+    # Use command line arguments if provided, otherwise use global variables
+    doc_set_1 = args.doc_set_1
+    doc_set_2 = args.doc_set_2
+    output_file = args.output
+    embedding_cache_1 = args.embedding_cache_1
+    embedding_cache_2 = args.embedding_cache_2
+    force_recalculate = args.force_recalculate
+    
+    # Check if both document set paths are provided
+    if not doc_set_1 or not doc_set_2:
+        print("Error: You must provide paths for both document sets.")
+        print("Either set the DOC_SET_1 and DOC_SET_2 variables in the script,")
+        print("or provide them as command line arguments with --doc-set-1 and --doc-set-2.")
+        return
+    
+    results = compare_document_sets(
+        doc_set_1=doc_set_1,
+        doc_set_2=doc_set_2,
+        model_name=args.model,
+        threshold=args.threshold,
+        segment_type=args.segment,
+        batch_size=args.batch_size,
+        max_files=args.max_files,
+        num_workers=args.workers,
+        use_gpu=args.use_gpu,
+        embedding_cache_1=embedding_cache_1,
+        embedding_cache_2=embedding_cache_2,
+        force_recalculate=force_recalculate
+    )
+
+    # Write results to file
+    write_similarity_results(results, output_file)
+
+if __name__ == "__main__":
+    main()
