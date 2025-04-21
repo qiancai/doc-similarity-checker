@@ -9,8 +9,12 @@ import os
 import argparse
 import glob
 import re
+import time
+import multiprocessing
+from datetime import datetime
 from typing import List, Tuple, Dict
 import numpy as np
+from tqdm import tqdm
 from sentence_transformers import SentenceTransformer, util
 import torch
 
@@ -20,7 +24,10 @@ DOC_SET_2 = "/Users/grcai/Documents/GitHub/doc-similarity-checker/for-test/doc-s
 MODEL_NAME = "all-MiniLM-L6-v2"  # SentenceTransformer model name
 SIMILARITY_THRESHOLD = 0.8  # Similarity threshold (0-1)
 SEGMENT_TYPE = "paragraph"  # Text segmentation method ('paragraph' or 'sentence')
-BATCH_SIZE = 32  # Batch size for encoding
+BATCH_SIZE = 64  # Batch size for encoding
+OUTPUT_FILE = "check_results.txt"  # Output file for results
+USE_GPU = torch.cuda.is_available()  # Use GPU if available
+NUM_WORKERS = max(1, multiprocessing.cpu_count() - 1)  # Number of worker processes for parallel processing
 
 def parse_args():
     """Parse command line arguments"""
@@ -32,19 +39,27 @@ def parse_args():
     parser.add_argument("--segment", choices=["paragraph", "sentence"], default=SEGMENT_TYPE, 
                        help="Text segmentation method")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size for encoding")
+    parser.add_argument("--output", type=str, default=OUTPUT_FILE, help="Output file for results")
+    parser.add_argument("--workers", type=int, default=NUM_WORKERS, help="Number of worker processes")
+    parser.add_argument("--max-files", type=int, default=None, help="Maximum number of files to process per document set")
+    parser.add_argument("--use-gpu", action="store_true", default=USE_GPU, help="Use GPU for embedding generation")
     return parser.parse_args()
 
-def find_markdown_files(directory: str) -> List[str]:
+def find_markdown_files(directory: str, max_files: int = None) -> List[str]:
     """
     Find all markdown files in the given directory and its subdirectories
     
     Args:
         directory: Path to the directory to search
+        max_files: Maximum number of files to return (for testing purposes)
         
     Returns:
         List of paths to markdown files
     """
-    return glob.glob(os.path.join(directory, "**", "*.md"), recursive=True)
+    files = glob.glob(os.path.join(directory, "**", "*.md"), recursive=True)
+    if max_files is not None and len(files) > max_files:
+        return files[:max_files]
+    return files
 
 def read_markdown_file(file_path: str) -> str:
     """
@@ -122,24 +137,45 @@ def extract_segments(file_path: str, segment_type: str) -> List[Tuple[str, str]]
     
     return [(file_path, segment) for segment in filtered_segments]
 
-def process_document_set(directory: str, segment_type: str) -> List[Tuple[str, str]]:
+def process_document_set(directory: str, segment_type: str, max_files: int = None, 
+                         num_workers: int = NUM_WORKERS) -> List[Tuple[str, str]]:
     """
     Process all markdown files in a document set
     
     Args:
         directory: Path to the document set
         segment_type: Type of segmentation ('paragraph' or 'sentence')
+        max_files: Maximum number of files to process (for testing)
+        num_workers: Number of worker processes
         
     Returns:
         List of tuples containing (file_path, segment_text)
     """
-    markdown_files = find_markdown_files(directory)
+    markdown_files = find_markdown_files(directory, max_files)
     all_segments = []
     
-    for file_path in markdown_files:
-        segments = extract_segments(file_path, segment_type)
-        all_segments.extend(segments)
+    print(f"Processing {len(markdown_files)} markdown files...")
     
+    # For small number of files, process sequentially
+    if len(markdown_files) < 10 or num_workers <= 1:
+        for file_path in tqdm(markdown_files, desc="Processing files"):
+            segments = extract_segments(file_path, segment_type)
+            all_segments.extend(segments)
+    else:
+        # For larger sets, use parallel processing
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            results = list(tqdm(
+                pool.starmap(
+                    extract_segments, 
+                    [(file_path, segment_type) for file_path in markdown_files]
+                ),
+                total=len(markdown_files),
+                desc="Processing files in parallel"
+            ))
+            for result in results:
+                all_segments.extend(result)
+    
+    print(f"Extracted {len(all_segments)} segments from {len(markdown_files)} files")
     return all_segments
 
 def compute_embeddings(model: SentenceTransformer, segments: List[Tuple[str, str]], 
@@ -156,7 +192,15 @@ def compute_embeddings(model: SentenceTransformer, segments: List[Tuple[str, str
         Tuple of (embeddings, segments)
     """
     texts = [segment[1] for segment in segments]
-    embeddings = model.encode(texts, batch_size=batch_size, convert_to_tensor=True)
+    
+    # Show progress bar for embedding generation
+    embeddings = model.encode(
+        texts, 
+        batch_size=batch_size, 
+        convert_to_tensor=True,
+        show_progress_bar=True
+    )
+    
     return embeddings, segments
 
 def find_similar_segments(segments1: List[Tuple[str, str]], embeddings1: torch.Tensor,
@@ -175,24 +219,42 @@ def find_similar_segments(segments1: List[Tuple[str, str]], embeddings1: torch.T
     Returns:
         List of (segment1, segment2, similarity_score) tuples
     """
-    # Compute cosine similarity
-    cosine_scores = util.cos_sim(embeddings1, embeddings2)
+    print("Computing cosine similarities...")
+    start_time = time.time()
     
-    # Find pairs with similarity scores above threshold
+    # For large embeddings, process in chunks to avoid memory issues
+    chunk_size = 1000  # Adjust based on available memory
     similar_pairs = []
-    for i in range(len(segments1)):
-        for j in range(len(segments2)):
-            if cosine_scores[i][j] >= threshold:
-                similar_pairs.append((segments1[i], segments2[j], cosine_scores[i][j].item()))
+    
+    total_chunks = (len(embeddings1) + chunk_size - 1) // chunk_size
+    
+    for i in tqdm(range(0, len(embeddings1), chunk_size), total=total_chunks, desc="Comparing chunks"):
+        # Get current chunk
+        embeddings1_chunk = embeddings1[i:i+chunk_size]
+        segments1_chunk = segments1[i:i+chunk_size]
+        
+        # Compute cosine similarity for current chunk
+        cosine_scores = util.cos_sim(embeddings1_chunk, embeddings2)
+        
+        # Find pairs with similarity scores above threshold
+        for chunk_idx, scores in enumerate(cosine_scores):
+            orig_idx = i + chunk_idx
+            for j, score in enumerate(scores):
+                if score >= threshold:
+                    similar_pairs.append((segments1_chunk[chunk_idx], segments2[j], score.item()))
     
     # Sort by similarity score (descending)
     similar_pairs.sort(key=lambda x: x[2], reverse=True)
+    
+    elapsed_time = time.time() - start_time
+    print(f"Found {len(similar_pairs)} similar pairs in {elapsed_time:.2f} seconds")
     
     return similar_pairs
 
 def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODEL_NAME, 
                          threshold: float = SIMILARITY_THRESHOLD, segment_type: str = SEGMENT_TYPE,
-                         batch_size: int = BATCH_SIZE) -> Dict:
+                         batch_size: int = BATCH_SIZE, max_files: int = None, 
+                         num_workers: int = NUM_WORKERS, use_gpu: bool = USE_GPU) -> Dict:
     """
     Compare two document sets and find similar content
     
@@ -203,19 +265,27 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
         threshold: Similarity threshold (0-1)
         segment_type: Type of segmentation ('paragraph' or 'sentence')
         batch_size: Batch size for encoding
+        max_files: Maximum number of files to process per document set
+        num_workers: Number of worker processes
+        use_gpu: Whether to use GPU for embedding generation
         
     Returns:
         Dictionary with similarity results
     """
+    start_time = time.time()
+    
     print(f"Loading SentenceTransformer model: {model_name}")
-    model = SentenceTransformer(model_name)
+    device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
+    model = SentenceTransformer(model_name, device=device)
+    
+    print(f"Using device: {device}")
     
     print(f"Processing document set 1: {doc_set_1}")
-    segments1 = process_document_set(doc_set_1, segment_type)
+    segments1 = process_document_set(doc_set_1, segment_type, max_files, num_workers)
     print(f"Found {len(segments1)} segments in document set 1")
     
     print(f"Processing document set 2: {doc_set_2}")
-    segments2 = process_document_set(doc_set_2, segment_type)
+    segments2 = process_document_set(doc_set_2, segment_type, max_files, num_workers)
     print(f"Found {len(segments2)} segments in document set 2")
     
     print("Computing embeddings for document set 1")
@@ -237,33 +307,46 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
             file_pairs[file_pair] = []
         file_pairs[file_pair].append((seg1[1], seg2[1], score))
     
+    total_time = time.time() - start_time
+    print(f"Total processing time: {total_time:.2f} seconds")
+    
     return {
         "total_similar_pairs": len(similar_pairs),
-        "file_pairs": file_pairs
+        "file_pairs": file_pairs,
+        "processing_time": total_time,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
-def print_similarity_results(results: Dict):
+def write_similarity_results(results: Dict, output_file: str):
     """
-    Print similarity results in a readable format
+    Write similarity results to a file
     
     Args:
         results: Dictionary with similarity results
+        output_file: Path to the output file
     """
-    print(f"\nFound {results['total_similar_pairs']} similar segment pairs\n")
-    
-    # Print results grouped by file pairs
-    for (file1, file2), pairs in results['file_pairs'].items():
-        print(f"Similar content between files:")
-        print(f"  File 1: {file1}")
-        print(f"  File 2: {file2}")
-        print(f"  Found {len(pairs)} similar segments\n")
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(f"Document Similarity Check Results\n")
+        f.write(f"================================\n\n")
+        f.write(f"Timestamp: {results['timestamp']}\n")
+        f.write(f"Processing time: {results['processing_time']:.2f} seconds\n\n")
+        f.write(f"Found {results['total_similar_pairs']} similar segment pairs\n\n")
         
-        for i, (text1, text2, score) in enumerate(pairs, 1):
-            print(f"  Pair {i} (similarity: {score:.4f}):")
-            print(f"    Doc 1: {text1[:150]}..." if len(text1) > 150 else f"    Doc 1: {text1}")
-            print(f"    Doc 2: {text2[:150]}..." if len(text2) > 150 else f"    Doc 2: {text2}")
-            print()
-        print("-" * 80)
+        # Write results grouped by file pairs
+        for (file1, file2), pairs in results['file_pairs'].items():
+            f.write(f"Similar content between files:\n")
+            f.write(f"  File 1: {file1}\n")
+            f.write(f"  File 2: {file2}\n")
+            f.write(f"  Found {len(pairs)} similar segments\n\n")
+            
+            for i, (text1, text2, score) in enumerate(pairs, 1):
+                f.write(f"  Pair {i} (similarity: {score:.4f}):\n")
+                f.write(f"    Doc 1: {text1[:150]}...\n" if len(text1) > 150 else f"    Doc 1: {text1}\n")
+                f.write(f"    Doc 2: {text2[:150]}...\n" if len(text2) > 150 else f"    Doc 2: {text2}\n")
+                f.write("\n")
+            f.write("-" * 80 + "\n\n")
+    
+    print(f"\nResults written to {output_file}")
 
 def main():
     args = parse_args()
@@ -271,6 +354,7 @@ def main():
     # Use command line arguments if provided, otherwise use global variables
     doc_set_1 = args.doc_set_1
     doc_set_2 = args.doc_set_2
+    output_file = args.output
     
     # Check if both document set paths are provided
     if not doc_set_1 or not doc_set_2:
@@ -285,10 +369,14 @@ def main():
         model_name=args.model,
         threshold=args.threshold,
         segment_type=args.segment,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        max_files=args.max_files,
+        num_workers=args.workers,
+        use_gpu=args.use_gpu
     )
 
-    print_similarity_results(results)
+    # Write results to file
+    write_similarity_results(results, output_file)
 
 if __name__ == "__main__":
     main()
