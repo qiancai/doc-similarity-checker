@@ -563,9 +563,11 @@ def write_similarity_results(results: Dict, output_file: str):
     """
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(f"# Document Similarity Check Results\n\n")
-        f.write(f"**Timestamp:** {results['timestamp']}  \n")
-        f.write(f"**Processing time:** {results['processing_time']:.2f} seconds  \n\n")
-        f.write(f"**Found {results['total_similar_pairs']} similar segment pairs**\n\n")
+        f.write(f"**Timestamp:** {results['timestamp']}  \n\n")
+        f.write(f"**Processing time:** {results['processing_time']:.2f} seconds\n\n")
+        f.write(f"**Doc set 1:** {DOC_SET_1}\n")
+        f.write(f"**Doc set 2:** {DOC_SET_2}\n\n")
+        f.write(f"**Summary**: Found {results['total_similar_pairs']} similar segment pairs\n\n")
         
         # Reorganize results by doc-set-1 files
         doc1_files = {}
@@ -745,7 +747,12 @@ def main():
     output_file = args.output
     embedding_cache_1 = args.embedding_cache_1
     embedding_cache_2 = args.embedding_cache_2
-    use_cache = not args.no_cache  # Invert the no_cache flag
+    # If --no-cache is provided, it will be True, otherwise it will be False (default)
+    # But we need to consider the global USE_CACHE setting as well
+    if args.no_cache:
+        use_cache = False  # Command line flag takes precedence 
+    else:
+        use_cache = USE_CACHE  # Use the global setting from the top of the file
     
     # Check if both document set paths are provided
     if not doc_set_1 or not doc_set_2:
@@ -753,6 +760,8 @@ def main():
         print("Either set the DOC_SET_1 and DOC_SET_2 variables in the script,")
         print("or provide them as command line arguments with --doc-set-1 and --doc-set-2.")
         return
+    
+    print(f"Cache usage setting: {'Enabled' if use_cache else 'Disabled'}")
     
     results = compare_document_sets(
         doc_set_1=doc_set_1,
