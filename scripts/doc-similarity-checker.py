@@ -22,7 +22,7 @@ import torch
 DOC_SET_1 = "/Users/grcai/Documents/GitHub/doc-similarity-checker/for-test/doc-set-1"  # Path to the first document set
 DOC_SET_2 = "/Users/grcai/Documents/GitHub/docs/vector-search"  # Path to the second document set
 MODEL_NAME = "all-MiniLM-L6-v2"  # SentenceTransformer model name
-SIMILARITY_THRESHOLD = 0.8  # Similarity threshold (0-1)f
+SIMILARITY_THRESHOLD = 0.83  # Similarity threshold (0-1)f
 SEGMENT_TYPE = "sentence"  # Text segmentation method ('paragraph' or 'sentence')
 BATCH_SIZE = 64  # Batch size for encoding
 OUTPUT_FILE = "check_results.md"  # Output file for results (changed to .md)
@@ -355,34 +355,51 @@ def write_similarity_results(results: Dict, output_file: str):
         f.write(f"**Processing time:** {results['processing_time']:.2f} seconds  \n\n")
         f.write(f"**Found {results['total_similar_pairs']} similar segment pairs**\n\n")
         
-        # Write results grouped by file pairs
+        # Reorganize results by doc-set-1 files
+        doc1_files = {}
         for (file1, file2), pairs in results['file_pairs'].items():
-            # Convert to relative paths if possible
+            if file1 not in doc1_files:
+                doc1_files[file1] = []
+            doc1_files[file1].append((file2, pairs))
+        
+        # Write results grouped by doc-set-1 files
+        for file1, comparisons in doc1_files.items():
+            # Convert to relative paths
             rel_file1 = os.path.relpath(file1) if os.path.isabs(file1) else file1
-            rel_file2 = os.path.relpath(file2) if os.path.isabs(file2) else file2
             
-            # Extract document titles
+            # Extract document title
             doc1_title = extract_title_from_markdown(file1)
-            doc2_title = extract_title_from_markdown(file2)
             
-            # Changed heading to focus on the file in set 1 with title
+            # Write heading for doc-set-1 file
             f.write(f"## Similar content in [{doc1_title}]({rel_file1})\n\n")
-            f.write(f"**Compared with:** [`{rel_file2}`]({rel_file2})  \n")
-            f.write(f"**Found {len(pairs)} similar segments**\n\n")
             
-            for i, (text1, text2, score) in enumerate(pairs, 1):
-                f.write(f"### Pair {i} (similarity: {score:.4f})\n\n")
+            total_segments = sum(len(pairs) for _, pairs in comparisons)
+            f.write(f"**Found {total_segments} similar segments across {len(comparisons)} comparison(s)**\n\n")
+            
+            pair_counter = 1
+            
+            # Process each comparison
+            for file2, pairs in comparisons:
+                rel_file2 = os.path.relpath(file2) if os.path.isabs(file2) else file2
                 
-                # Find line numbers for text1 in file1
-                line_num1 = find_line_number(file1, text1)
-                # Create a markdown link with line number in the URL
-                f.write(f"**[{rel_file1}: line {line_num1}]({rel_file1}#L{line_num1})**\n\n```\n{text1}\n```\n\n")
+                f.write(f"### Compared with: [`{rel_file2}`]({rel_file2})\n\n")
                 
-                # Find line numbers for text2 in file2
-                line_num2 = find_line_number(file2, text2)
-                # Create a markdown link with line number in the URL
-                f.write(f"**[{rel_file2}: line {line_num2}]({rel_file2}#L{line_num2})**\n\n```\n{text2}\n```\n\n")
-            f.write("---\n\n")
+                for text1, text2, score in pairs:
+                    f.write(f"#### Pair {pair_counter} (similarity: {score:.4f})\n\n")
+                    
+                    # Find line numbers for text1 in file1
+                    line_num1 = find_line_number(file1, text1)
+                    # Create a markdown link with line number in the URL
+                    f.write(f"**[{rel_file1}: line {line_num1}]({rel_file1}#L{line_num1})**\n\n```\n{text1}\n```\n\n")
+                    
+                    # Find line numbers for text2 in file2
+                    line_num2 = find_line_number(file2, text2)
+                    # Create a markdown link with line number in the URL
+                    f.write(f"**[{rel_file2}: line {line_num2}]({rel_file2}#L{line_num2})**\n\n```\n{text2}\n```\n\n")
+                    
+                    pair_counter += 1
+                
+                f.write("---\n\n")
     
     print(f"\nResults written to {output_file}")
 
