@@ -22,8 +22,8 @@ import torch
 DOC_SET_1 = "/Users/grcai/Documents/GitHub/doc-similarity-checker/for-test/doc-set-1"  # Path to the first document set
 DOC_SET_2 = "/Users/grcai/Documents/GitHub/doc-similarity-checker/for-test/doc-set-2"  # Path to the second document set
 MODEL_NAME = "all-MiniLM-L6-v2"  # SentenceTransformer model name
-SIMILARITY_THRESHOLD = 0.8  # Similarity threshold (0-1)
-SEGMENT_TYPE = "paragraph"  # Text segmentation method ('paragraph' or 'sentence')
+SIMILARITY_THRESHOLD = 0.8  # Similarity threshold (0-1)f
+SEGMENT_TYPE = "sentence"  # Text segmentation method ('paragraph' or 'sentence')
 BATCH_SIZE = 64  # Batch size for encoding
 OUTPUT_FILE = "check_results.md"  # Output file for results (changed to .md)
 USE_GPU = torch.cuda.is_available()  # Use GPU if available
@@ -337,9 +337,9 @@ def write_similarity_results(results: Dict, output_file: str):
             rel_file1 = os.path.relpath(file1) if os.path.isabs(file1) else file1
             rel_file2 = os.path.relpath(file2) if os.path.isabs(file2) else file2
             
-            f.write(f"## Similar content between files\n\n")
-            f.write(f"**File 1:** [`{rel_file1}`]({rel_file1})  \n")
-            f.write(f"**File 2:** [`{rel_file2}`]({rel_file2})  \n")
+            # Changed heading to focus on the file in set 1
+            f.write(f"## Similar content in [`{rel_file1}`]({rel_file1})\n\n")
+            f.write(f"**Compared with:** [`{rel_file2}`]({rel_file2})  \n")
             f.write(f"**Found {len(pairs)} similar segments**\n\n")
             
             for i, (text1, text2, score) in enumerate(pairs, 1):
