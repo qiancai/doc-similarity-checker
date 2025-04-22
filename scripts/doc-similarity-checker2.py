@@ -15,6 +15,8 @@ from datetime import datetime
 from typing import List, Tuple, Dict
 import numpy as np
 from tqdm import tqdm
+import string
+from collections import Counter
 
 # Set TOKENIZERS_PARALLELISM environment variable to prevent warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -27,10 +29,11 @@ import pickle
 DOC_SET_1 = "/Users/grcai/Documents/GitHub/docs"  # Path to the first document set
 DOC_SET_2 = "/Users/grcai/Downloads/c-docs-main"  # Path to the second document set
 MODEL_NAME = "all-MiniLM-L6-v2"  # SentenceTransformer model name
-SIMILARITY_THRESHOLD = 0.85  # Similarity threshold (0-1)f
+SIMILARITY_THRESHOLD = 0.90  # 提高相似度阈值，减少误报 (原为0.85)
 SEGMENT_TYPE = "sentence"  # Text segmentation method ('paragraph' or 'sentence')
 BATCH_SIZE = 64  # Batch size for encoding
 OUTPUT_FILE = "check_results.md"  # Output file for results (changed to .md)
+SHORT_SENTENCES_OUTPUT_FILE = "check_results_short_sentences.md"  # Output file for short sentences results
 USE_GPU = torch.cuda.is_available()  # Use GPU if available
 NUM_WORKERS = max(1, multiprocessing.cpu_count() - 2)  # Number of worker processes for parallel processing
 EMBEDDING_CACHE_1 = "cache/doc_set_1_embeddings.pkl"  # Path to save/load embeddings for document set 1
@@ -168,10 +171,12 @@ def extract_segments(file_path: str, segment_type: str) -> List[Tuple[str, str]]
     else:  # sentence
         segments = split_into_sentences(text)
     
-    # Filter out too short segments and code blocks
+    # Filter out too short segments, code blocks, and special patterns
     filtered_segments = []
     in_code_block = False
+    
     for segment in segments:
+        # 跳过代码块
         if segment.startswith("```") and segment.endswith("```"):
             continue
         if segment.startswith("```"):
@@ -179,8 +184,26 @@ def extract_segments(file_path: str, segment_type: str) -> List[Tuple[str, str]]
             continue
         if in_code_block:
             continue
-        if len(segment.split()) >= 5:  # Only keep segments with at least 5 words
-            filtered_segments.append(segment)
+            
+        # 清理Markdown格式
+        clean_segment = segment.strip()
+        
+        # 清理Markdown表格分隔线
+        if re.match(r'^[\|\-\s]+$', clean_segment):
+            continue
+            
+        # 清理Markdown列表标记
+        clean_segment = re.sub(r'^[\*\-\+]\s+', '', clean_segment)
+        
+        # 清理Markdown标题标记
+        clean_segment = re.sub(r'^#+\s+', '', clean_segment)
+        
+        # 移除HTML标签
+        clean_segment = re.sub(r'<[^>]*>', '', clean_segment)
+        
+        # 过滤出足够长的片段（最少5个词）
+        if len(clean_segment.split()) >= 5:
+            filtered_segments.append(clean_segment)
     
     return [(file_path, segment) for segment in filtered_segments]
 
@@ -304,6 +327,95 @@ def process_similarity_chunk(start_idx, end_idx, embeddings1, segments1, embeddi
     
     return similar_pairs
 
+def has_contextual_relevance(text1: str, text2: str) -> bool:
+    """
+    检查两个文本片段是否具有上下文相关性（而不仅仅是相似的指令模式）
+    
+    Args:
+        text1: 第一个文本片段
+        text2: 第二个文本片段
+        
+    Returns:
+        如果文本片段上下文相关则返回True，否则返回False
+    """
+    # 转换为小写并分词
+    words1 = set(text1.lower().translate(str.maketrans('', '', string.punctuation)).split())
+    words2 = set(text2.lower().translate(str.maketrans('', '', string.punctuation)).split())
+    
+    # 获取除了停用词外的关键词
+    stop_words = {'the', 'this', 'that', 'and', 'or', 'to', 'in', 'on', 'at', 'by', 'for', 'with', 'you', 'can', 'is', 'are', 'be'}
+    keywords1 = words1 - stop_words
+    keywords2 = words2 - stop_words
+    
+    # 如果两端都是UI指令模式，但共享的关键词少于2个，可能是假相似
+    if (('click' in words1 or 'select' in words1) and ('click' in words2 or 'select' in words2)):
+        common_keywords = keywords1.intersection(keywords2)
+        if len(common_keywords) < 2:
+            return False
+    
+    # 获取专业术语和实体名词（假设长度>=5的词更可能是专业术语）
+    terms1 = {w for w in keywords1 if len(w) >= 5}
+    terms2 = {w for w in keywords2 if len(w) >= 5}
+    
+    # 如果共享重要术语，则相关
+    if terms1.intersection(terms2):
+        return True
+    
+    # 提取可能的代码片段或配置（如包含特殊字符的词）
+    code_pattern = re.compile(r'[a-zA-Z0-9_]+[._\-][a-zA-Z0-9_]+')
+    code1 = set(re.findall(code_pattern, text1))
+    code2 = set(re.findall(code_pattern, text2))
+    
+    # 如果共享代码片段，则相关
+    if code1.intersection(code2):
+        return True
+    
+    # 前三个主要名词
+    nouns1 = [w for w in keywords1 if len(w) > 3]
+    nouns2 = [w for w in keywords2 if len(w) > 3]
+    
+    # 如果共享主要名词很少，可能不相关
+    common_nouns = set(nouns1).intersection(set(nouns2))
+    if len(common_nouns) < 2 and (len(nouns1) >= 3 and len(nouns2) >= 3):
+        return False
+    
+    return True
+
+def is_ui_instruction(text: str) -> bool:
+    """
+    检测文本是否是UI指令（如点击、编辑等）
+    
+    Args:
+        text: 要检查的文本
+        
+    Returns:
+        如果是UI指令则返回True，否则返回False
+    """
+    # UI交互动词列表
+    ui_verbs = ['click', 'tap', 'select', 'choose', 'edit', 'modify', 'press', 'check']
+    
+    # 查找常见UI交互模式
+    text_lower = text.lower()
+    
+    # 如果文本很短且包含UI交互词，更可能是UI指令
+    if len(text.split()) < 10:
+        for verb in ui_verbs:
+            if verb in text_lower:
+                return True
+    
+    # 查找常见的UI指令模式
+    ui_patterns = [
+        r'click\s+(on\s+)?(the\s+)?["`\']?[\w\s]+["`\']?',
+        r'(press|select|choose)\s+(the\s+)?["`\']?[\w\s]+["`\']?',
+        r'go\s+to\s+(the\s+)?["`\']?[\w\s]+["`\']?',
+    ]
+    
+    for pattern in ui_patterns:
+        if re.search(pattern, text_lower):
+            return True
+            
+    return False
+
 def find_similar_segments_parallel(segments1: List[Tuple[str, str]], embeddings1: torch.Tensor,
                         segments2: List[Tuple[str, str]], embeddings2: torch.Tensor, 
                         threshold: float, num_workers: int = NUM_WORKERS) -> List[Tuple[Tuple[str, str], Tuple[str, str], float]]:
@@ -356,12 +468,25 @@ def find_similar_segments_parallel(segments1: List[Tuple[str, str]], embeddings1
         # 查找相似度高于阈值的对
         for chunk_idx, scores in enumerate(cosine_scores):
             orig_idx = start_idx + chunk_idx
+            
+            # 获取当前段落
+            current_segment_text = segments1_chunk[chunk_idx][1]
+            
             # 使用向量化操作找出高于阈值的索引
             above_threshold = torch.where(scores >= threshold)[0]
             
             for j in above_threshold:
                 j_idx = j.item()  # 转换为Python整数
-                all_similar_pairs.append((segments1_chunk[chunk_idx], segments2[j_idx], scores[j_idx].item()))
+                matched_segment_text = segments2[j_idx][1]
+                
+                # 对于UI指令类文本，使用更高的相似度阈值
+                if is_ui_instruction(current_segment_text) and is_ui_instruction(matched_segment_text):
+                    # 对于UI指令，要求更高的相似度
+                    if scores[j_idx].item() >= (threshold + 0.05):
+                        all_similar_pairs.append((segments1_chunk[chunk_idx], segments2[j_idx], scores[j_idx].item()))
+                else:
+                    # 非UI指令文本使用原阈值
+                    all_similar_pairs.append((segments1_chunk[chunk_idx], segments2[j_idx], scores[j_idx].item()))
         
         # 释放内存
         del cosine_scores
@@ -727,16 +852,72 @@ def extract_title_from_markdown(file_path: str) -> str:
         print(f"Error extracting title from {file_path}: {e}")
         return os.path.basename(file_path)
 
-def write_similarity_results(results: Dict, output_file: str):
+def write_similarity_results(results: Dict, output_file: str, short_sentences_output_file: str = SHORT_SENTENCES_OUTPUT_FILE):
     """
-    Write similarity results to a Markdown file
+    Write similarity results to Markdown files, separating short sentences
+    
+    Args:
+        results: Dictionary with similarity results
+        output_file: Path to the main output file
+        short_sentences_output_file: Path to the output file for short sentences
+    """
+    # Separate regular and short sentence pairs
+    regular_pairs = {}
+    short_pairs = {}
+    
+    for (file1, file2), pairs in results['file_pairs'].items():
+        regular_file_pairs = []
+        short_file_pairs = []
+        
+        for seg1, seg2, score in pairs:
+            # Check if either segment is a short sentence
+            if is_short_sentence(seg1) or is_short_sentence(seg2):
+                short_file_pairs.append((seg1, seg2, score))
+            else:
+                regular_file_pairs.append((seg1, seg2, score))
+        
+        if regular_file_pairs:
+            regular_pairs[(file1, file2)] = regular_file_pairs
+        
+        if short_file_pairs:
+            short_pairs[(file1, file2)] = short_file_pairs
+    
+    # Write regular results
+    regular_results = {
+        "total_similar_pairs": sum(len(pairs) for pairs in regular_pairs.values()),
+        "file_pairs": regular_pairs,
+        "processing_time": results['processing_time'],
+        "timestamp": results['timestamp']
+    }
+    
+    # Write short sentences results
+    short_results = {
+        "total_similar_pairs": sum(len(pairs) for pairs in short_pairs.values()),
+        "file_pairs": short_pairs,
+        "processing_time": results['processing_time'],
+        "timestamp": results['timestamp']
+    }
+    
+    # Write regular results file
+    _write_results_file(regular_results, output_file, "Regular")
+    
+    # Write short sentences results file
+    _write_results_file(short_results, short_sentences_output_file, "Short Sentences")
+    
+    print(f"\nRegular results written to {output_file}")
+    print(f"Short sentences results written to {short_sentences_output_file}")
+
+def _write_results_file(results: Dict, output_file: str, results_type: str):
+    """
+    Helper function to write a specific type of results to a file
     
     Args:
         results: Dictionary with similarity results
         output_file: Path to the output file
+        results_type: Type of results (e.g., "Regular", "Short Sentences")
     """
     with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(f"# Document Similarity Check Results\n\n")
+        f.write(f"# Document Similarity Check Results ({results_type})\n\n")
         f.write(f"**Timestamp:** {results['timestamp']}  \n\n")
         f.write(f"**Processing time:** {results['processing_time']:.2f} seconds\n\n")
         f.write(f"**Doc set 1:** {DOC_SET_1}\n")
@@ -793,8 +974,6 @@ def write_similarity_results(results: Dict, output_file: str):
                     pair_counter += 1
                 
                 f.write("---\n\n")
-    
-    print(f"\nResults written to {output_file}")
 
 def find_line_number(file_path: str, text_segment: str) -> int:
     """
@@ -902,7 +1081,6 @@ def is_valid_text(text: str) -> bool:
         return False
     
     # Check for a reasonable ratio of printable characters
-    import string
     printable_chars = set(string.printable)
     printable_count = sum(1 for c in text if c in printable_chars)
     
@@ -911,6 +1089,23 @@ def is_valid_text(text: str) -> bool:
         return False
         
     return True
+
+def is_short_sentence(text: str, word_threshold: int = 8) -> bool:
+    """
+    Check if a text segment is a short sentence
+    
+    Args:
+        text: The text to check
+        word_threshold: Maximum number of words to be considered a short sentence
+        
+    Returns:
+        True if the text is a short sentence, False otherwise
+    """
+    # Remove punctuation and count words
+    cleaned_text = text.translate(str.maketrans('', '', string.punctuation))
+    word_count = len(cleaned_text.split())
+    
+    return word_count < word_threshold
 
 def main():
     args = parse_args()
@@ -960,7 +1155,7 @@ def main():
         max_cache_size_gb=max_cache_size_gb
     )
 
-    # Write results to file
+    # Write results to files with separation of short sentences
     write_similarity_results(results, output_file)
 
 if __name__ == "__main__":
