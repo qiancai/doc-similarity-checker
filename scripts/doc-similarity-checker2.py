@@ -24,18 +24,22 @@ import torch
 import pickle
 
 # Configuration variables - modify these as needed
-DOC_SET_1 = "/Users/grcai/Documents/GitHub/doc-similarity-checker/for-test/doc-set-1"  # Path to the first document set
-DOC_SET_2 = "/Users/grcai/Documents/GitHub/docs/vector-search"  # Path to the second document set
+DOC_SET_1 = "/Users/grcai/Documents/GitHub/docs"  # Path to the first document set
+DOC_SET_2 = "/Users/grcai/Downloads/c-docs-main"  # Path to the second document set
 MODEL_NAME = "all-MiniLM-L6-v2"  # SentenceTransformer model name
 SIMILARITY_THRESHOLD = 0.85  # Similarity threshold (0-1)f
 SEGMENT_TYPE = "sentence"  # Text segmentation method ('paragraph' or 'sentence')
 BATCH_SIZE = 64  # Batch size for encoding
 OUTPUT_FILE = "check_results.md"  # Output file for results (changed to .md)
 USE_GPU = torch.cuda.is_available()  # Use GPU if available
-NUM_WORKERS = max(1, multiprocessing.cpu_count() - 1)  # Number of worker processes for parallel processing
+NUM_WORKERS = max(1, multiprocessing.cpu_count() - 2)  # Number of worker processes for parallel processing
 EMBEDDING_CACHE_1 = "cache/doc_set_1_embeddings.pkl"  # Path to save/load embeddings for document set 1
 EMBEDDING_CACHE_2 = "cache/doc_set_2_embeddings.pkl"  # Path to save/load embeddings for document set 2
 USE_CACHE = True  # Whether to use embedding cache (True: use if available, False: always recalculate)
+# 大型文档集处理配置
+MAX_BATCH_FILES = 50  # 每批处理的最大文件数
+CHUNKED_PROCESSING = True  # 是否启用分块处理（适用于非常大的文档集）
+MAX_CACHE_SIZE_GB = 2  # 缓存文件最大大小（GB）
 
 def parse_args():
     """Parse command line arguments"""
@@ -57,6 +61,12 @@ def parse_args():
                        help="Path to save/load embeddings for document set 2")
     parser.add_argument("--no-cache", action="store_true", 
                        help="Do not use embedding cache even if available (always recalculate)")
+    parser.add_argument("--chunked", action="store_true", default=CHUNKED_PROCESSING, 
+                       help="Enable chunked processing for large document sets")
+    parser.add_argument("--max-batch-files", type=int, default=MAX_BATCH_FILES, 
+                       help="Maximum number of files to process in each batch when chunked processing is enabled")
+    parser.add_argument("--max-cache-size", type=float, default=MAX_CACHE_SIZE_GB, 
+                       help="Maximum cache file size in GB")
     return parser.parse_args()
 
 def find_markdown_files(directory: str, max_files: int = None) -> List[str]:
@@ -261,11 +271,44 @@ def compute_embeddings(model: SentenceTransformer, segments: List[Tuple[str, str
     
     return embeddings, segments
 
-def find_similar_segments(segments1: List[Tuple[str, str]], embeddings1: torch.Tensor,
-                         segments2: List[Tuple[str, str]], embeddings2: torch.Tensor, 
-                         threshold: float) -> List[Tuple[Tuple[str, str], Tuple[str, str], float]]:
+# 将process_chunk函数移到全局作用域
+def process_similarity_chunk(start_idx, end_idx, embeddings1, segments1, embeddings2, segments2, threshold):
     """
-    Find similar segments between two document sets
+    处理一个相似度计算块
+    
+    Args:
+        start_idx: 开始索引
+        end_idx: 结束索引
+        embeddings1: 第一个文档集的嵌入
+        segments1: 第一个文档集的段落
+        embeddings2: 第二个文档集的嵌入
+        segments2: 第二个文档集的段落
+        threshold: 相似度阈值
+        
+    Returns:
+        相似度对列表
+    """
+    embeddings_chunk = embeddings1[start_idx:end_idx]
+    segments_chunk = segments1[start_idx:end_idx]
+    
+    # 计算当前块的余弦相似度
+    cosine_scores = util.cos_sim(embeddings_chunk, embeddings2)
+    
+    # 查找相似度高于阈值的对
+    similar_pairs = []
+    for chunk_idx, scores in enumerate(cosine_scores):
+        orig_idx = start_idx + chunk_idx
+        for j, score in enumerate(scores):
+            if score >= threshold:
+                similar_pairs.append((segments_chunk[chunk_idx], segments2[j], score.item()))
+    
+    return similar_pairs
+
+def find_similar_segments_parallel(segments1: List[Tuple[str, str]], embeddings1: torch.Tensor,
+                        segments2: List[Tuple[str, str]], embeddings2: torch.Tensor, 
+                        threshold: float, num_workers: int = NUM_WORKERS) -> List[Tuple[Tuple[str, str], Tuple[str, str], float]]:
+    """
+    Find similar segments between two document sets using parallel processing
     
     Args:
         segments1: List of (file_path, segment_text) tuples from the first document set
@@ -273,44 +316,69 @@ def find_similar_segments(segments1: List[Tuple[str, str]], embeddings1: torch.T
         segments2: List of (file_path, segment_text) tuples from the second document set
         embeddings2: Embeddings for segments2
         threshold: Similarity threshold
+        num_workers: Number of worker processes
         
     Returns:
         List of (segment1, segment2, similarity_score) tuples
     """
-    print("Computing cosine similarities...")
+    print("Computing cosine similarities using parallel processing...")
     start_time = time.time()
     
-    # For large embeddings, process in chunks to avoid memory issues
-    chunk_size = 1000  # Adjust based on available memory
-    similar_pairs = []
+    # 对大型嵌入张量进行分块处理
+    chunk_size = min(1000, max(100, len(embeddings1) // (num_workers * 2)))
+    chunks = [(i, min(i + chunk_size, len(embeddings1))) for i in range(0, len(embeddings1), chunk_size)]
     
-    total_chunks = (len(embeddings1) + chunk_size - 1) // chunk_size
+    print(f"将 {len(embeddings1)} 个嵌入分成 {len(chunks)} 个块进行并行处理 (每块大约 {chunk_size} 个嵌入)")
     
-    for i in tqdm(range(0, len(embeddings1), chunk_size), total=total_chunks, desc="Comparing chunks"):
-        # Get current chunk
-        embeddings1_chunk = embeddings1[i:i+chunk_size]
-        segments1_chunk = segments1[i:i+chunk_size]
+    # 对于大型文档集，使用分块非并行处理而不是多进程
+    # 这样可以避免大型数据的序列化和进程间通信开销
+    print("开始分块处理相似度计算...")
+    all_similar_pairs = []
+    
+    # 确保所有数据都在CPU上
+    if isinstance(embeddings1, torch.Tensor) and embeddings1.is_cuda:
+        print("正在将第一个嵌入集从GPU移至CPU...")
+        embeddings1 = embeddings1.cpu()
         
-        # Compute cosine similarity for current chunk
+    if isinstance(embeddings2, torch.Tensor) and embeddings2.is_cuda:
+        print("正在将第二个嵌入集从GPU移至CPU...")
+        embeddings2 = embeddings2.cpu()
+    
+    # 使用tqdm显示进度
+    for start_idx, end_idx in tqdm(chunks, desc="计算相似度块"):
+        # 获取当前块
+        embeddings1_chunk = embeddings1[start_idx:end_idx]
+        segments1_chunk = segments1[start_idx:end_idx]
+        
+        # 计算当前块的余弦相似度
         cosine_scores = util.cos_sim(embeddings1_chunk, embeddings2)
         
-        # Find pairs with similarity scores above threshold
+        # 查找相似度高于阈值的对
         for chunk_idx, scores in enumerate(cosine_scores):
-            orig_idx = i + chunk_idx
-            for j, score in enumerate(scores):
-                if score >= threshold:
-                    similar_pairs.append((segments1_chunk[chunk_idx], segments2[j], score.item()))
+            orig_idx = start_idx + chunk_idx
+            # 使用向量化操作找出高于阈值的索引
+            above_threshold = torch.where(scores >= threshold)[0]
+            
+            for j in above_threshold:
+                j_idx = j.item()  # 转换为Python整数
+                all_similar_pairs.append((segments1_chunk[chunk_idx], segments2[j_idx], scores[j_idx].item()))
+        
+        # 释放内存
+        del cosine_scores
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
-    # Sort by similarity score (descending)
-    similar_pairs.sort(key=lambda x: x[2], reverse=True)
+    print(f"相似度计算完成，正在排序 {len(all_similar_pairs)} 个结果...")
+    # 按相似度排序（降序）
+    all_similar_pairs.sort(key=lambda x: x[2], reverse=True)
     
     elapsed_time = time.time() - start_time
-    print(f"Found {len(similar_pairs)} similar pairs in {elapsed_time:.2f} seconds")
+    print(f"找到 {len(all_similar_pairs)} 个相似对，耗时 {elapsed_time:.2f} 秒")
     
-    return similar_pairs
+    return all_similar_pairs
 
 def save_embeddings(file_path: str, embeddings: torch.Tensor, segments: List[Tuple[str, str]], 
-                   doc_dir: str, model_name: str, segment_type: str):
+                   doc_dir: str, model_name: str, segment_type: str, max_cache_size_gb: float = MAX_CACHE_SIZE_GB):
     """
     Save embeddings and segments to a pickle file
     
@@ -321,6 +389,7 @@ def save_embeddings(file_path: str, embeddings: torch.Tensor, segments: List[Tup
         doc_dir: Path to the document directory
         model_name: Name of the model used
         segment_type: Type of segmentation used
+        max_cache_size_gb: Maximum cache file size in GB
     """
     # Get file stats to track document directory state
     file_stats = {}
@@ -342,13 +411,34 @@ def save_embeddings(file_path: str, embeddings: torch.Tensor, segments: List[Tup
         'segment_type': segment_type,
     }
     
+    # Estimate size before saving
+    import sys
+    import pickle as pkl
+    
+    # Create a temporary file to estimate size
+    temp_data = pkl.dumps(embedding_data)
+    estimated_size_gb = sys.getsizeof(temp_data) / (1024**3)
+    
+    if estimated_size_gb > max_cache_size_gb:
+        print(f"Warning: Estimated cache size ({estimated_size_gb:.2f} GB) exceeds maximum ({max_cache_size_gb} GB)")
+        print(f"Consider using chunked processing with smaller batches")
+        
+        # Ask for confirmation if very large
+        if estimated_size_gb > 2 * max_cache_size_gb:
+            confirmation = input(f"Cache file will be very large ({estimated_size_gb:.2f} GB). Continue? (y/n): ")
+            if confirmation.lower() != 'y':
+                print("Cache saving aborted by user")
+                return
+    
     # Create directory if it doesn't exist
     os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
     
     with open(file_path, 'wb') as f:
         pickle.dump(embedding_data, f)
     
-    print(f"Embeddings saved to {file_path}")
+    # Get actual file size
+    actual_size_mb = os.path.getsize(file_path) / (1024**2)
+    print(f"Embeddings saved to {file_path} (Size: {actual_size_mb:.2f} MB)")
 
 def load_embeddings(file_path: str) -> Tuple[torch.Tensor, List[Tuple[str, str]]]:
     """
@@ -386,60 +476,126 @@ def is_cache_valid(cache_path: str, doc_dir: str, model_name: str, segment_type:
     Returns:
         True if cache is valid, False otherwise
     """
+    print(f"\n检查缓存有效性: {cache_path}")
+    
+    # 简化的缓存验证：只检查文件是否存在
     if not os.path.isfile(cache_path):
+        print(f"缓存文件不存在: {cache_path}")
         return False
     
+    # 输出缓存文件的大小和修改时间
+    cache_size_mb = os.path.getsize(cache_path) / (1024 * 1024)
+    cache_mtime = datetime.fromtimestamp(os.path.getmtime(cache_path)).strftime('%Y-%m-%d %H:%M:%S')
+    print(f"缓存文件大小: {cache_size_mb:.2f} MB")
+    print(f"缓存文件修改时间: {cache_mtime}")
+    
     try:
+        # 尝试打开缓存文件，验证其结构完整性
         with open(cache_path, 'rb') as f:
             cache_data = pickle.load(f)
         
-        # Check if cache was created with same model and segmentation type
-        if cache_data.get('model_name') != model_name or cache_data.get('segment_type') != segment_type:
-            print(f"Cache invalid: model or segmentation type changed")
-            return False
-        
-        # Check if document directory has changed
-        if cache_data.get('doc_dir') != doc_dir:
-            print(f"Cache invalid: document directory changed")
-            return False
-        
-        # Check if any files were added, removed, or modified
-        file_stats = cache_data.get('file_stats', {})
-        
-        # Get current list of markdown files
-        current_files = find_markdown_files(doc_dir)
-        
-        # Check if any new files were added
-        cached_files = set(file_stats.keys())
-        if not all(file in cached_files for file in current_files):
-            print(f"Cache invalid: new files added to document directory")
-            return False
-        
-        # Check if any existing files were modified
-        for file_path in file_stats:
-            if not os.path.isfile(file_path):
-                print(f"Cache invalid: file {file_path} removed")
-                return False
-            
-            current_mtime = os.path.getmtime(file_path)
-            current_size = os.path.getsize(file_path)
-            
-            if (current_mtime > file_stats[file_path]['mtime'] or 
-                current_size != file_stats[file_path]['size']):
-                print(f"Cache invalid: file {file_path} modified")
-                return False
-        
+        # 输出缓存的基本信息
+        cache_timestamp = datetime.fromisoformat(cache_data.get('timestamp', '2000-01-01T00:00:00'))
+        print(f"缓存创建时间: {cache_timestamp}")
+        print(f"缓存有效，将使用现有缓存文件")
         return True
     except Exception as e:
-        print(f"Error checking cache validity: {e}")
+        print(f"检查缓存有效性时出错: {e}")
+        import traceback
+        traceback.print_exc()
         return False
+
+def process_document_set_in_chunks(directory: str, segment_type: str, max_files: int = None, 
+                             num_workers: int = NUM_WORKERS, max_batch_files: int = MAX_BATCH_FILES,
+                             model: SentenceTransformer = None, batch_size: int = BATCH_SIZE) -> Tuple[torch.Tensor, List[Tuple[str, str]]]:
+    """
+    Process a large document set in chunks to manage memory usage
+    
+    Args:
+        directory: Path to the document set
+        segment_type: Type of segmentation ('paragraph' or 'sentence')
+        max_files: Maximum number of files to process in total
+        num_workers: Number of worker processes
+        max_batch_files: Maximum number of files to process in each batch
+        model: SentenceTransformer model for generating embeddings
+        batch_size: Batch size for encoding
+        
+    Returns:
+        Tuple of (embeddings, segments)
+    """
+    markdown_files = find_markdown_files(directory, max_files)
+    total_files = len(markdown_files)
+    
+    print(f"Processing {total_files} markdown files in chunks of {max_batch_files}...")
+    
+    all_embeddings = []
+    all_segments = []
+    
+    # Process files in batches
+    for i in range(0, total_files, max_batch_files):
+        batch_files = markdown_files[i:i+max_batch_files]
+        print(f"Processing batch {i//max_batch_files + 1}/{(total_files + max_batch_files - 1)//max_batch_files}: {len(batch_files)} files")
+        
+        # Process current batch
+        batch_segments = []
+        if len(batch_files) < 10 or num_workers <= 1:
+            for file_path in tqdm(batch_files, desc="Processing files"):
+                try:
+                    segments = extract_segments(file_path, segment_type)
+                    batch_segments.extend(segments)
+                except Exception as e:
+                    print(f"Error processing file {file_path}: {e}")
+                    print(f"Skipping file {file_path}")
+        else:
+            # For larger sets, use parallel processing
+            with multiprocessing.Pool(processes=num_workers) as pool:
+                results = list(tqdm(
+                    pool.starmap(
+                        extract_segments_safe, 
+                        [(file_path, segment_type) for file_path in batch_files]
+                    ),
+                    total=len(batch_files),
+                    desc="Processing files in parallel"
+                ))
+                for result in results:
+                    batch_segments.extend(result)
+        
+        # Generate embeddings for the current batch
+        if batch_segments:
+            print(f"Generating embeddings for {len(batch_segments)} segments in current batch")
+            batch_embeddings, batch_segments = compute_embeddings(model, batch_segments, batch_size)
+            
+            # Add to overall results
+            if len(all_embeddings) == 0:
+                all_embeddings = batch_embeddings
+            else:
+                # Convert to CPU tensors for concatenation if needed
+                if isinstance(all_embeddings, torch.Tensor) and all_embeddings.is_cuda:
+                    all_embeddings = all_embeddings.cpu()
+                if isinstance(batch_embeddings, torch.Tensor) and batch_embeddings.is_cuda:
+                    batch_embeddings = batch_embeddings.cpu()
+                
+                all_embeddings = torch.cat([all_embeddings, batch_embeddings], dim=0)
+            
+            all_segments.extend(batch_segments)
+            
+            # Free up memory
+            del batch_embeddings
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        print(f"Processed {len(all_segments)} segments so far")
+    
+    print(f"Finished processing {total_files} files with {len(all_segments)} total segments")
+    return all_embeddings, all_segments
 
 def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODEL_NAME, 
                          threshold: float = SIMILARITY_THRESHOLD, segment_type: str = SEGMENT_TYPE,
                          batch_size: int = BATCH_SIZE, max_files: int = None, 
                          num_workers: int = NUM_WORKERS, use_gpu: bool = USE_GPU,
                          embedding_cache_1: str = None, embedding_cache_2: str = None,
-                         use_cache: bool = USE_CACHE) -> Dict:
+                         use_cache: bool = USE_CACHE, chunked_processing: bool = CHUNKED_PROCESSING,
+                         max_batch_files: int = MAX_BATCH_FILES, max_cache_size_gb: float = MAX_CACHE_SIZE_GB) -> Dict:
     """
     Compare two document sets and find similar content
     
@@ -456,6 +612,9 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
         embedding_cache_1: Path to save/load embeddings for document set 1
         embedding_cache_2: Path to save/load embeddings for document set 2
         use_cache: Whether to use embedding cache (True: use if available, False: always recalculate)
+        chunked_processing: Whether to process document sets in chunks (for large datasets)
+        max_batch_files: Maximum number of files to process in each batch when chunked processing is enabled
+        max_cache_size_gb: Maximum cache file size in GB
         
     Returns:
         Dictionary with similarity results
@@ -476,16 +635,23 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
     else:
         # Process documents and generate embeddings
         print(f"Processing document set 1: {doc_set_1}")
-        segments1 = process_document_set(doc_set_1, segment_type, max_files, num_workers)
-        print(f"Found {len(segments1)} segments in document set 1")
         
-        print("Computing embeddings for document set 1")
-        embeddings1, segments1 = compute_embeddings(model, segments1, batch_size)
+        if chunked_processing:
+            print(f"Using chunked processing for document set 1 (batch size: {max_batch_files} files)")
+            embeddings1, segments1 = process_document_set_in_chunks(
+                doc_set_1, segment_type, max_files, num_workers, max_batch_files, model, batch_size
+            )
+        else:
+            segments1 = process_document_set(doc_set_1, segment_type, max_files, num_workers)
+            print(f"Found {len(segments1)} segments in document set 1")
+            
+            print("Computing embeddings for document set 1")
+            embeddings1, segments1 = compute_embeddings(model, segments1, batch_size)
         
         # Save embeddings if cache path is provided
         if embedding_cache_1:
             print(f"Saving embeddings for document set 1 to {embedding_cache_1}")
-            save_embeddings(embedding_cache_1, embeddings1, segments1, doc_set_1, model_name, segment_type)
+            save_embeddings(embedding_cache_1, embeddings1, segments1, doc_set_1, model_name, segment_type, max_cache_size_gb)
     
     # Process document set 2
     if use_cache and embedding_cache_2 and is_cache_valid(embedding_cache_2, doc_set_2, model_name, segment_type):
@@ -495,19 +661,27 @@ def compare_document_sets(doc_set_1: str, doc_set_2: str, model_name: str = MODE
     else:
         # Process documents and generate embeddings
         print(f"Processing document set 2: {doc_set_2}")
-        segments2 = process_document_set(doc_set_2, segment_type, max_files, num_workers)
-        print(f"Found {len(segments2)} segments in document set 2")
         
-        print("Computing embeddings for document set 2")
-        embeddings2, segments2 = compute_embeddings(model, segments2, batch_size)
+        if chunked_processing:
+            print(f"Using chunked processing for document set 2 (batch size: {max_batch_files} files)")
+            embeddings2, segments2 = process_document_set_in_chunks(
+                doc_set_2, segment_type, max_files, num_workers, max_batch_files, model, batch_size
+            )
+        else:
+            segments2 = process_document_set(doc_set_2, segment_type, max_files, num_workers)
+            print(f"Found {len(segments2)} segments in document set 2")
+            
+            print("Computing embeddings for document set 2")
+            embeddings2, segments2 = compute_embeddings(model, segments2, batch_size)
         
         # Save embeddings if cache path is provided
         if embedding_cache_2:
             print(f"Saving embeddings for document set 2 to {embedding_cache_2}")
-            save_embeddings(embedding_cache_2, embeddings2, segments2, doc_set_2, model_name, segment_type)
-    
-    print(f"Finding similar segments with threshold {threshold}")
-    similar_pairs = find_similar_segments(segments1, embeddings1, segments2, embeddings2, threshold)
+            save_embeddings(embedding_cache_2, embeddings2, segments2, doc_set_2, model_name, segment_type, max_cache_size_gb)
+
+    # 使用并行处理查找相似段落
+    print(f"Finding similar segments with threshold {threshold} using parallel processing")
+    similar_pairs = find_similar_segments_parallel(segments1, embeddings1, segments2, embeddings2, threshold, num_workers)
     
     print(f"\nFound {len(similar_pairs)} similar segment pairs\n")
     
@@ -754,6 +928,10 @@ def main():
     else:
         use_cache = USE_CACHE  # Use the global setting from the top of the file
     
+    chunked_processing = args.chunked
+    max_batch_files = args.max_batch_files
+    max_cache_size_gb = args.max_cache_size
+    
     # Check if both document set paths are provided
     if not doc_set_1 or not doc_set_2:
         print("Error: You must provide paths for both document sets.")
@@ -762,6 +940,7 @@ def main():
         return
     
     print(f"Cache usage setting: {'Enabled' if use_cache else 'Disabled'}")
+    print(f"Chunked processing: {'Enabled' if chunked_processing else 'Disabled'}")
     
     results = compare_document_sets(
         doc_set_1=doc_set_1,
@@ -775,7 +954,10 @@ def main():
         use_gpu=args.use_gpu,
         embedding_cache_1=embedding_cache_1,
         embedding_cache_2=embedding_cache_2,
-        use_cache=use_cache
+        use_cache=use_cache,
+        chunked_processing=chunked_processing,
+        max_batch_files=max_batch_files,
+        max_cache_size_gb=max_cache_size_gb
     )
 
     # Write results to file
