@@ -149,7 +149,7 @@ def split_into_paragraphs(text: str) -> List[str]:
 
 def split_into_sentences(text: str) -> List[str]:
     """
-    Split text into sentences (simple implementation)
+    Split text into sentences with improved handling for Markdown content
     
     Args:
         text: The text to split
@@ -157,10 +157,39 @@ def split_into_sentences(text: str) -> List[str]:
     Returns:
         List of sentences
     """
-    # Simple sentence splitting by common end punctuation
-    # A more sophisticated approach would use a dedicated NLP library
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    return [s.strip() for s in sentences if s.strip()]
+    # Temporarily replace certain patterns that could confuse sentence splitting
+    # Protect URLs, file paths, and version numbers
+    protected_patterns = []
+    
+    # Protect URLs
+    url_pattern = re.compile(r'https?://[^\s]+')
+    matches = url_pattern.finditer(text)
+    for i, match in enumerate(matches):
+        placeholder = f"___URL_{i}___"
+        protected_patterns.append((placeholder, match.group(0)))
+        text = text.replace(match.group(0), placeholder)
+    
+    # Protect version numbers and file paths
+    version_pattern = re.compile(r'\b\d+\.\d+(\.\d+)*\b')
+    matches = version_pattern.finditer(text)
+    for i, match in enumerate(matches):
+        placeholder = f"___VERSION_{i}___"
+        protected_patterns.append((placeholder, match.group(0)))
+        text = text.replace(match.group(0), placeholder)
+    
+    # Split sentences using common end punctuation
+    # Handle cases like "e.g." and "i.e." as non-sentence boundaries
+    text = re.sub(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?|!)\s', '\n', text)
+    sentences = [s.strip() for s in text.split('\n') if s.strip()]
+    
+    # Replace placeholders back
+    restored_sentences = []
+    for sentence in sentences:
+        for placeholder, original in protected_patterns:
+            sentence = sentence.replace(placeholder, original)
+        restored_sentences.append(sentence)
+    
+    return restored_sentences
 
 def extract_segments(file_path: str, segment_type: str) -> List[Tuple[str, str]]:
     """
@@ -175,46 +204,89 @@ def extract_segments(file_path: str, segment_type: str) -> List[Tuple[str, str]]
     """
     text = read_markdown_file(file_path)
     
-    if segment_type == "paragraph":
-        segments = split_into_paragraphs(text)
-    else:  # sentence
-        segments = split_into_sentences(text)
+    # First split text by lines to avoid comparing multi-line segments with mixed content
+    lines = text.split('\n')
     
-    # Filter out too short segments, code blocks, and special patterns
+    # Process each line or group of lines as appropriate
     filtered_segments = []
     in_code_block = False
+    current_paragraph = []
     
-    for segment in segments:
-        # 跳过代码块
-        if segment.startswith("```") and segment.endswith("```"):
-            continue
-        if segment.startswith("```"):
+    for line in lines:
+        # Handle code blocks
+        if line.strip().startswith("```"):
             in_code_block = not in_code_block
+            # Reset paragraph when entering or exiting a code block
+            current_paragraph = []
             continue
+        
         if in_code_block:
             continue
-            
-        # 清理Markdown格式
-        clean_segment = segment.strip()
         
-        # 清理Markdown表格分隔线
-        if re.match(r'^[\|\-\s]+$', clean_segment):
+        # Skip empty lines and markdown separators
+        line = line.strip()
+        if not line or line.startswith('---') or re.match(r'^[\|\-\s]+$', line):
+            # End of paragraph - process what we've collected if anything
+            if current_paragraph and segment_type == "paragraph":
+                joined_paragraph = " ".join(current_paragraph).strip()
+                if len(joined_paragraph.split()) >= 5:
+                    filtered_segments.append(joined_paragraph)
+                current_paragraph = []
             continue
-            
-        # 清理Markdown列表标记
-        clean_segment = re.sub(r'^[\*\-\+]\s+', '', clean_segment)
         
-        # 清理Markdown标题标记
-        clean_segment = re.sub(r'^#+\s+', '', clean_segment)
+        # Clean the line for consistent processing
+        clean_line = clean_markdown_line(line)
         
-        # 移除HTML标签
-        clean_segment = re.sub(r'<[^>]*>', '', clean_segment)
-        
-        # 过滤出足够长的片段（最少5个词）
-        if len(clean_segment.split()) >= 5:
-            filtered_segments.append(clean_segment)
+        # For paragraph segmentation, collect lines
+        if segment_type == "paragraph":
+            current_paragraph.append(clean_line)
+        else:  # For sentence segmentation
+            # Split the line into sentences
+            line_sentences = split_into_sentences(clean_line)
+            for sentence in line_sentences:
+                if len(sentence.split()) >= 5:
+                    filtered_segments.append(sentence)
+    
+    # Don't forget to process any remaining paragraph
+    if current_paragraph and segment_type == "paragraph":
+        joined_paragraph = " ".join(current_paragraph).strip()
+        if len(joined_paragraph.split()) >= 5:
+            filtered_segments.append(joined_paragraph)
     
     return [(file_path, segment) for segment in filtered_segments]
+
+def clean_markdown_line(line: str) -> str:
+    """
+    Clean a single line of markdown text
+    
+    Args:
+        line: The line to clean
+        
+    Returns:
+        Cleaned line
+    """
+    clean_line = line.strip()
+    
+    # Remove markdown headings
+    if clean_line.startswith('#'):
+        clean_line = re.sub(r'^#+\s+', '', clean_line)
+    
+    # Clean list markers
+    clean_line = re.sub(r'^[\*\-\+]\s+', '', clean_line)
+    
+    # Remove HTML tags
+    clean_line = re.sub(r'<[^>]*>', '', clean_line)
+    
+    # Remove markdown links but keep the text
+    clean_line = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', clean_line)
+    
+    # Remove inline code markers
+    clean_line = re.sub(r'`([^`]+)`', r'\1', clean_line)
+    
+    # Remove common markdown annotations [text]{#annotation}
+    clean_line = re.sub(r'\{#[a-zA-Z0-9_-]+\}', '', clean_line)
+    
+    return clean_line
 
 def extract_segments_safe(file_path: str, segment_type: str) -> List[Tuple[str, str]]:
     """
