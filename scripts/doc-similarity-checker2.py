@@ -17,6 +17,7 @@ import numpy as np
 from tqdm import tqdm
 import string
 from collections import Counter
+import pandas as pd
 
 # Set TOKENIZERS_PARALLELISM environment variable to prevent warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -26,19 +27,21 @@ import torch
 import pickle
 
 # Configuration variables - modify these as needed
-DOC_SET_1 = "/Users/grcai/Documents/GitHub/docs"  # Path to the first document set
-DOC_SET_2 = "/Users/grcai/Downloads/c-docs-main"  # Path to the second document set
+DOC_SET_1 = "/Users/grcai/Documents/GitHub/doc-similarity-checker/for-test/doc-set-1"  # Path to the first document set
+DOC_SET_2 = "/Users/grcai/Documents/GitHub/doc-similarity-checker/for-test/doc-set-2"  # Path to the second document set
 MODEL_NAME = "all-MiniLM-L6-v2"  # SentenceTransformer model name
-SIMILARITY_THRESHOLD = 0.90  # 提高相似度阈值，减少误报 (原为0.85)
+SIMILARITY_THRESHOLD = 0.60  # 相似度阈值
 SEGMENT_TYPE = "sentence"  # Text segmentation method ('paragraph' or 'sentence')
 BATCH_SIZE = 64  # Batch size for encoding
 OUTPUT_FILE = "check_results.md"  # Output file for results (changed to .md)
 SHORT_SENTENCES_OUTPUT_FILE = "check_results_short_sentences.md"  # Output file for short sentences results
+EXCEL_OUTPUT_FILE = "similarity_results.xlsx"  # Excel output file for results
+IGNORE_FILE = "ignore.txt"  # File containing text patterns to ignore
 USE_GPU = torch.cuda.is_available()  # Use GPU if available
 NUM_WORKERS = max(1, multiprocessing.cpu_count() - 2)  # Number of worker processes for parallel processing
 EMBEDDING_CACHE_1 = "cache/doc_set_1_embeddings.pkl"  # Path to save/load embeddings for document set 1
 EMBEDDING_CACHE_2 = "cache/doc_set_2_embeddings.pkl"  # Path to save/load embeddings for document set 2
-USE_CACHE = True  # Whether to use embedding cache (True: use if available, False: always recalculate)
+USE_CACHE = False  # Whether to use embedding cache (True: use if available, False: always recalculate)
 # 大型文档集处理配置
 MAX_BATCH_FILES = 50  # 每批处理的最大文件数
 CHUNKED_PROCESSING = True  # 是否启用分块处理（适用于非常大的文档集）
@@ -55,6 +58,12 @@ def parse_args():
                        help="Text segmentation method")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size for encoding")
     parser.add_argument("--output", type=str, default=OUTPUT_FILE, help="Output file for results")
+    parser.add_argument("--short-output", type=str, default=SHORT_SENTENCES_OUTPUT_FILE, 
+                       help="Output file for short sentences results")
+    parser.add_argument("--excel-output", type=str, default=EXCEL_OUTPUT_FILE, 
+                       help="Excel output file for all results")
+    parser.add_argument("--ignore-file", type=str, default=IGNORE_FILE,
+                       help="File containing text patterns to ignore")
     parser.add_argument("--workers", type=int, default=NUM_WORKERS, help="Number of worker processes")
     parser.add_argument("--max-files", type=int, default=None, help="Maximum number of files to process per document set")
     parser.add_argument("--use-gpu", action="store_true", default=USE_GPU, help="Use GPU for embedding generation")
@@ -852,16 +861,110 @@ def extract_title_from_markdown(file_path: str) -> str:
         print(f"Error extracting title from {file_path}: {e}")
         return os.path.basename(file_path)
 
-def write_similarity_results(results: Dict, output_file: str, short_sentences_output_file: str = SHORT_SENTENCES_OUTPUT_FILE):
+def load_ignore_patterns(ignore_file: str = IGNORE_FILE) -> List[str]:
     """
-    Write similarity results to Markdown files, separating short sentences
+    Load text patterns to ignore from a file
+    
+    Args:
+        ignore_file: Path to the file containing patterns to ignore
+        
+    Returns:
+        List of patterns to ignore
+    """
+    if not os.path.exists(ignore_file):
+        print(f"Warning: Ignore file {ignore_file} not found. No patterns will be ignored.")
+        return []
+    
+    try:
+        with open(ignore_file, 'r', encoding='utf-8') as f:
+            patterns = [line.strip() for line in f.readlines() if line.strip()]
+        print(f"Loaded {len(patterns)} patterns to ignore from {ignore_file}")
+        return patterns
+    except Exception as e:
+        print(f"Error loading ignore patterns from {ignore_file}: {e}")
+        return []
+
+def should_ignore_text(text: str, ignore_patterns: List[str]) -> bool:
+    """
+    Check if text matches any of the ignore patterns
+    
+    Args:
+        text: Text to check
+        ignore_patterns: List of patterns to ignore
+        
+    Returns:
+        True if the text should be ignored, False otherwise
+    """
+    # Normalize the text for comparison
+    normalized_text = text.strip()
+    
+    # Check exact matches
+    if normalized_text in ignore_patterns:
+        return True
+    
+    return False
+
+def export_results_to_excel(results: Dict, ignore_patterns: List[str] = None, excel_output_file: str = EXCEL_OUTPUT_FILE):
+    """
+    Export similarity results to an Excel file with separate sheets for regular and short sentences
+    
+    Args:
+        results: Dictionary with similarity results
+        ignore_patterns: List of patterns to ignore
+        excel_output_file: Path to the Excel output file
+    """
+    # Split into regular and short sentences
+    regular_pairs = []
+    short_pairs = []
+    
+    for (file1, file2), pairs in results['file_pairs'].items():
+        for text1, text2, score in pairs:
+            # Skip if either segment matches an ignore pattern
+            if ignore_patterns and (should_ignore_text(text1, ignore_patterns) or should_ignore_text(text2, ignore_patterns)):
+                continue
+                
+            row_data = {
+                'File1': os.path.abspath(file1),
+                'File2': os.path.abspath(file2),
+                'Text1': text1,
+                'Text2': text2,
+                'Similarity': score
+            }
+            
+            if is_short_sentence(text1) or is_short_sentence(text2):
+                short_pairs.append(row_data)
+            else:
+                regular_pairs.append(row_data)
+    
+    # Create DataFrames
+    df_regular = pd.DataFrame(regular_pairs)
+    df_short = pd.DataFrame(short_pairs)
+    
+    # Create Excel writer
+    with pd.ExcelWriter(excel_output_file, engine='openpyxl') as writer:
+        df_regular.to_excel(writer, sheet_name='Regular Pairs', index=False)
+        df_short.to_excel(writer, sheet_name='Short Sentences', index=False)
+    
+    print(f"\nResults exported to Excel file: {excel_output_file}")
+    print(f"  - Regular pairs: {len(regular_pairs)}")
+    print(f"  - Short sentence pairs: {len(short_pairs)}")
+
+def write_similarity_results(results: Dict, output_file: str, short_sentences_output_file: str = SHORT_SENTENCES_OUTPUT_FILE, 
+                           excel_output_file: str = EXCEL_OUTPUT_FILE, ignore_file: str = IGNORE_FILE):
+    """
+    Write similarity results to Markdown files and Excel, separating short sentences and ignoring specified patterns
     
     Args:
         results: Dictionary with similarity results
         output_file: Path to the main output file
         short_sentences_output_file: Path to the output file for short sentences
+        excel_output_file: Path to the Excel output file for all results
+        ignore_file: Path to the file containing patterns to ignore
     """
-    # Separate regular and short sentence pairs
+    # Load ignore patterns
+    ignore_patterns = load_ignore_patterns(ignore_file)
+    
+    # Separate regular and short sentence pairs, filtering out ignored patterns
     regular_pairs = {}
     short_pairs = {}
     
@@ -870,6 +973,10 @@ def write_similarity_results(results: Dict, output_file: str, short_sentences_ou
         short_file_pairs = []
         
         for seg1, seg2, score in pairs:
+            # Skip if either segment matches an ignore pattern
+            if ignore_patterns and (should_ignore_text(seg1, ignore_patterns) or should_ignore_text(seg2, ignore_patterns)):
+                continue
+                
             # Check if either segment is a short sentence
             if is_short_sentence(seg1) or is_short_sentence(seg2):
                 short_file_pairs.append((seg1, seg2, score))
@@ -903,6 +1010,9 @@ def write_similarity_results(results: Dict, output_file: str, short_sentences_ou
     
     # Write short sentences results file
     _write_results_file(short_results, short_sentences_output_file, "Short Sentences")
+    
+    # Export to Excel
+    export_results_to_excel(results, ignore_patterns, excel_output_file)
     
     print(f"\nRegular results written to {output_file}")
     print(f"Short sentences results written to {short_sentences_output_file}")
@@ -1019,7 +1129,7 @@ def find_line_number(file_path: str, text_segment: str) -> int:
             
             # Count the number of newlines before the starting position
             line_num = content[:start_pos].count('\n') + 1
-            print(f"Found text segment at line {line_num} in {file_path} using {encoding} encoding")
+            #print(f"Found text segment at line {line_num} in {file_path} using {encoding} encoding")
             return line_num
             
         except UnicodeDecodeError:
@@ -1114,6 +1224,9 @@ def main():
     doc_set_1 = args.doc_set_1
     doc_set_2 = args.doc_set_2
     output_file = args.output
+    short_sentences_output_file = args.short_output
+    excel_output_file = args.excel_output
+    ignore_file = args.ignore_file
     embedding_cache_1 = args.embedding_cache_1
     embedding_cache_2 = args.embedding_cache_2
     # If --no-cache is provided, it will be True, otherwise it will be False (default)
@@ -1155,8 +1268,8 @@ def main():
         max_cache_size_gb=max_cache_size_gb
     )
 
-    # Write results to files with separation of short sentences
-    write_similarity_results(results, output_file)
+    # Write results to files with separation of short sentences and export to Excel
+    write_similarity_results(results, output_file, short_sentences_output_file, excel_output_file, ignore_file)
 
 if __name__ == "__main__":
     main()
