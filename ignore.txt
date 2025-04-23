@@ -1,0 +1,99 @@
+- **Database**: enter the database that you want to connect to.
+- **Database**: enter the database you want to connect to.
+- `<DATABASE>`: The name of the database you want to connect to.
+- The aggregate function has no related `group by` clause.
+"### Export to CSV files
+You can export data to CSV files by adding the `--filetype csv` argument."
+"### Online Analytical Processing (OLAP)
+Click **Forgot password**, and then check your email for the link to reset the password.
+Click the gear icon in the upper right corner to open the settings page.
+Configure the permissions to access the S3 bucket.
+Currently, this feature is experimental and not recommended for use in production environments.
+Go to the [AWS VPC console](https://us-west-2.console.aws.amazon.com/vpc/home), and click **Endpoint services** to accept the endpoint request.
+In addition to the log, you can also view the slow query using the `ADMIN SHOW SLOW` command.
+It is recommended to use column aliases instead.
+Oracle is a registered trademark of Oracle Corporation and/or its
+Other names may be trademarks of their respective
+Select the database that you want to connect to.
+The **primary key** is defined in the `CREATE TABLE` statement.
+To create an API key, perform the following steps:
+To delete an endpoint, perform the following steps:
+To enable GTID, the upstream MySQL must have enabled GTID.
+To enable this mode, the upstream MySQL must also enable GTID.
+"To resolve this issue, you can adjust the timeout settings by the following steps:
+Type '\c' to clear the current input statement.
+You can either connect a new account or select an existing account.
+You can use either of the following methods to configure the bucket access:
+This feature might be changed or removed without prior notice.
+This release does not bring any user behavior changes.
+In v7.5.0, this feature becomes generally available (GA).
+The default compression level for `zstd` is 3.
+Starting from v7.6.0, the default compression algorithm is `zstd`.
+This package is at least compatible with all maintained versions of Node.js.
+This issue will be resolved in later versions.
+You need to set the following configuration items:
+You can use one of the following methods:
+(Optional) Enter a description for your API key.
+**Database**: enter the database that you want to connect to.
+**Support Azure Blob Storage as a target storage for backup**
+``: The name of the database you want to connect to.
+> Currently, this feature is only available upon request.
+> This feature is in beta and not recommended for production environments.
+Add the following permissions to the role, and then click **Add**.
+Click **Connections** in the sidebar and then click **New Connection**.
+Click **New dashboard** in the top menu and choose the dashboard you want to view.
+Click **Validate Connection and Next** to validate the information you have entered.
+Click the **Create API Key** button to create a new API key.
+Configure in the configuration file or command-line arguments:
+Configure the MySQL client to use TLS connections
+Currently, this feature is experimental, and it is not recommended that you use it in the production environment.
+DB: The name of the currently connected default database.
+Dropping a table if it exists, and conditionally creating a table if it does not exist:
+Fix the crash issue when converting the data type from string to decimal
+Fix the issue of using the wrong time zone when the TZ environment variable is not set #512
+Fix the issue that OUTER JOIN is mistakenly converted to INNER JOIN in some conditions #7899
+Fix the overflow issue when converting a decimal to a float in some cases #10730
+For a detailed list of the parameters, see Others.
+For more information, see Configure an IP access list.
+For more information, see Set Up Private Endpoint Connections.
+For the **data replication** strategy, set up Data Migration (DM).
+If the connection test is successful, the **Connection test** dialog is displayed as follows.
+If the target cluster version is earlier than v6.1.0, an error occurs.
+If you forget your password, you can reset it by email as follows:
+If you have any questions or need assistance, contact our support team.
+If you try to enable this feature, an error is returned.
+If you set this configuration item to 0, compression is disabled.
+In some cases, this can improve the query performance.
+In the **Connection Type** drop-down list, select **Private Endpoint**, and then click **Create Private Endpoint Connection**.
+In the **Create API Key** dialog box, do the following:
+In the **SQL** box, enter the following SQL:
+In v7.6.0, this feature becomes generally available (GA).
+In your project directory, run the following command to install the required packages:
+Launch DBeaver and click **New Database Connection** in the upper-left corner.
+Note that this configuration item is usually kept at the default value.
+Otherwise, the timezone specified by the time_zone in the current session will be used.
+set a max to prevent unbounded growth of the cache.** See
+Starting from v7.4.0, you can use the WITH ROLLUP modifier and GROUPING function in the GROUP BY clause.
+You can use one of the following methods:
+You can fix this issue by specifying the correct kafka-version parameter in the --sink-uri configuration.
+Window Functions are a common type of SQL function.
+Verify that you are using the latest version:
+Use DROP GLOBAL TEMPORARY TABLE to drop global temporary tables.
+To insert data into a table, use the INSERT statement:
+To delete the data in a table, use the DELETE statement:
+To create an API key for a Data App, see Create an API key.
+To complete this tutorial, you need the following:
+This statement is included for compatibility with MySQL.
+This statement is included only for compatibility with MySQL.
+This reduces memory usage and makes limit queries faster.
+This option is disabled by default with the false value.
+This option is disabled by default and its default value is false.
+This feature is still in beta and only available upon request:
+The specific steps are described in the following sections.
+The GTID is the global transaction ID of MySQL or MariaDB.
+The default value is "", which means no compression.
+The **primary key** is defined in the CREATE TABLE statement.
+Support using Azure Blob storage as the backup storage
+SHOW [FULL] TABLES does not show local temporary tables.
+Record the VPC endpoint ID you just created.
+It is recommended to keep the default value.
